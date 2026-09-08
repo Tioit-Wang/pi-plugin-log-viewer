@@ -7,17 +7,12 @@ const bridge = window.pluginBridge;
 const $ = (id) => document.getElementById(id);
 
 const OVERSCAN = 10;
-const LEVEL_RE = /\b(FATAL|ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\b/;
-const LEVEL_MAP = {
-  FATAL: "error", ERROR: "error", WARN: "warn", WARNING: "warn",
-  INFO: "info", DEBUG: "debug", TRACE: "debug",
-};
-
 const state = {
   tabs: [],
   activeId: null,
   nextTabId: 1,
   fontSize: Number(localStorage.getItem("lv.fontSize")) || 12,
+  fontFamily: localStorage.getItem("lv.fontFamily") || "default",
   theme: localStorage.getItem("lv.theme") || null, // null → follow host
 };
 let rowH = 20;
@@ -57,6 +52,24 @@ function invoke(channel, payload) {
 
 function activeTab() {
   return state.tabs.find((t) => t.id === state.activeId) || null;
+}
+
+function hasLevelFilter(tab) {
+  return Boolean(tab && ((tab.levels && tab.levels.size) || (tab.excludedLevels && tab.excludedLevels.size)));
+}
+
+function levelFilterPayload(tab) {
+  if (!hasLevelFilter(tab)) return null;
+  return {
+    include: tab.levels ? [...tab.levels] : [],
+    exclude: tab.excludedLevels ? [...tab.excludedLevels] : [],
+  };
+}
+
+function badgeState(tab, level) {
+  if (tab && tab.levels && tab.levels.has(level)) return "include";
+  if (tab && tab.excludedLevels && tab.excludedLevels.has(level)) return "exclude";
+  return "neutral";
 }
 
 function atBottom() {
@@ -151,6 +164,8 @@ function createTab({ mode, name, path, adapter, saved }) {
     encoding: (saved && saved.encoding) || "utf-8",
     follow: Boolean(saved && saved.follow),
     levels: saved && Array.isArray(saved.levels) && saved.levels.length ? new Set(saved.levels) : null,
+    excludedLevels:
+      saved && Array.isArray(saved.excludeLevels) && saved.excludeLevels.length ? new Set(saved.excludeLevels) : null,
     lastLine: (saved && saved.line) || 1,
     totalLines: 0,
     indexDone: false,
@@ -228,8 +243,13 @@ function applyFont() {
   rowH = state.fontSize + 8;
   document.documentElement.style.setProperty("--row-h", `${rowH}px`);
   localStorage.setItem("lv.fontSize", String(state.fontSize));
+  document.documentElement.style.setProperty(
+    "--log-font",
+    state.fontFamily === "default" ? '"Cascadia Mono", Consolas, "SF Mono", Menlo, "Courier New", monospace' : state.fontFamily,
+  );
+  localStorage.setItem("lv.fontFamily", state.fontFamily);
   const tab = activeTab();
-  if (tab) renderWindow(tab, tab.levels ? tab.feedFrom : lineAtScroll());
+  if (tab) renderWindow(tab, hasLevelFilter(tab) ? tab.feedFrom : lineAtScroll());
 }
 
 function lineAtScroll() {
@@ -241,7 +261,7 @@ function visibleCount() {
 }
 
 function spacerHeight(tab) {
-  const lines = tab.levels ? tab.feedCount : Math.max(tab.totalLines, 1);
+  const lines = hasLevelFilter(tab) ? tab.feedCount : Math.max(tab.totalLines, 1);
   return Math.max(lines, 1) * rowH;
 }
 
@@ -250,18 +270,8 @@ function updateSpacer(tab) {
 }
 
 function levelClass(line) {
-  const m = LEVEL_RE.exec(line);
-  if (!m) return "";
-  const k = LEVEL_MAP[m[1]];
-  return k === "error" ? " lv-error" : k === "warn" ? " lv-warn" : "";
-}
-
-function isUnsafeUserRegex(source) {
-  if (!source || source.length > 200) return true;
-  return (
-    /\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)\s*(?:[*+]|\{\d+,?\d*\})/.test(source) ||
-    /(?:\[[^\]]*\]|\\[dws])\s*[*+]\s*(?:[*+]|\{\d+,?\d*\})/i.test(source)
-  );
+  const level = LogLevel.detectLevel(line);
+  return level && level !== "other" ? ` lv-${level}` : "";
 }
 
 function buildText(tab, text) {
@@ -272,40 +282,52 @@ function buildText(tab, text) {
     frag.append(text);
     return frag;
   }
-  let ranges = [];
-  if (s.isRegex) {
-    if (isUnsafeUserRegex(s.query)) {
-      frag.append(text);
-      return frag;
-    }
-    try {
-      const re = new RegExp(s.query, s.caseSensitive ? "g" : "gi");
-      let m;
-      while ((m = re.exec(text)) && ranges.length < 200) {
-        if (m[0].length === 0) {
-          re.lastIndex += 1;
-          continue;
+  let terms;
+  try {
+    terms = LogQuery.parseQuery(s.query, { isRegex: s.isRegex }).includeTerms;
+  } catch {
+    terms = [];
+  }
+  const ranges = [];
+  for (const term of terms) {
+    if (s.isRegex) {
+      try {
+        LogQuery.assertSafeRegex(term);
+        const re = new RegExp(term, s.caseSensitive ? "g" : "gi");
+        let m;
+        while ((m = re.exec(text)) && ranges.length < 200) {
+          if (m[0].length === 0) {
+            re.lastIndex += 1;
+            continue;
+          }
+          ranges.push([m.index, m.index + m[0].length]);
         }
-        ranges.push([m.index, m.index + m[0].length]);
+      } catch {
+        // The engine reports invalid expressions; a stale row simply has no mark.
       }
-    } catch {
-      ranges = [];
-    }
-  } else {
-    const hay = s.caseSensitive ? text : text.toLowerCase();
-    const needle = s.caseSensitive ? s.query : s.query.toLowerCase();
-    let idx = hay.indexOf(needle);
-    while (idx !== -1 && ranges.length < 200) {
-      ranges.push([idx, idx + needle.length]);
-      idx = hay.indexOf(needle, idx + needle.length);
+    } else {
+      const hay = s.caseSensitive ? text : text.toLowerCase();
+      const needle = s.caseSensitive ? term : term.toLowerCase();
+      let idx = hay.indexOf(needle);
+      while (idx !== -1 && ranges.length < 200) {
+        ranges.push([idx, idx + needle.length]);
+        idx = hay.indexOf(needle, idx + Math.max(needle.length, 1));
+      }
     }
   }
   if (!ranges.length) {
     frag.append(text);
     return frag;
   }
+  ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged = [];
+  for (const range of ranges) {
+    const previous = merged[merged.length - 1];
+    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1]);
+    else merged.push(range);
+  }
   let pos = 0;
-  for (const [a, b] of ranges) {
+  for (const [a, b] of merged) {
     if (a > pos) frag.append(text.slice(pos, a));
     const mark = document.createElement("mark");
     mark.textContent = text.slice(a, b);
@@ -345,7 +367,7 @@ function paintRows(tab, rows, { absolute, offset = 0 }) {
 }
 
 function renderWindow(tab, fromLine) {
-  if (tab.levels) {
+  if (hasLevelFilter(tab)) {
     loadMoreFiltered(tab);
     renderFilteredViewport(tab);
     return;
@@ -353,9 +375,9 @@ function renderWindow(tab, fromLine) {
   fromLine = Math.max(1, Math.floor(fromLine) || 1);
   const token = (tab.renderToken = (tab.renderToken || 0) + 1);
   const count = visibleCount() + OVERSCAN * 2;
-  const from = tab.levels ? fromLine : Math.max(1, fromLine - OVERSCAN);
+  const from = Math.max(1, fromLine - OVERSCAN);
   tab.adapter
-    .page({ fileId: tab.fileId, fromLine: from, count, levels: tab.levels ? [...tab.levels] : null })
+    .page({ fileId: tab.fileId, fromLine: from, count, levels: null })
     .then((res) => {
       if (token !== tab.renderToken || state.activeId !== tab.id) return;
       tab.totalLines = res.totalLines;
@@ -365,7 +387,7 @@ function renderWindow(tab, fromLine) {
       tab.window = { from, lines: res.lines, eof: res.eof, hasMore: res.hasMore };
       updateBadges(tab);
       updateStatus(tab);
-      if (tab.levels) {
+      if (hasLevelFilter(tab)) {
         // filtered feed rows render sequentially with original line numbers
         const existing = tab.feedRows || [];
         const merged = dedupeAppend(existing, res.lines);
@@ -395,6 +417,11 @@ function dedupeAppend(existing, fresh) {
   return existing.concat(fresh.filter((x) => x.no > lastNo));
 }
 
+function renderFilteredViewport(tab) {
+  updateSpacer(tab);
+  paintRows(tab, tab.feedRows || [], { absolute: false });
+}
+
 function renderFilteredReset(tab) {
   tab.feedRows = [];
   tab.feedCount = 0;
@@ -408,7 +435,7 @@ function renderFilteredReset(tab) {
 
 /** Load the next batch of level-matching rows (also continues past empty windows). */
 async function loadMoreFiltered(tab) {
-  if (!tab.levels || tab.loadingMore || tab.filterEof) return;
+  if (!hasLevelFilter(tab) || tab.loadingMore || tab.filterEof) return;
   tab.loadingMore = true;
   try {
     for (let guard = 0; guard < 30; guard += 1) {
@@ -416,7 +443,7 @@ async function loadMoreFiltered(tab) {
         fileId: tab.fileId,
         fromLine: tab.feedFrom,
         count: visibleCount() * 2,
-        levels: [...tab.levels],
+        levels: levelFilterPayload(tab),
       });
       tab.totalLines = res.totalLines;
       tab.indexDone = res.indexDone;
@@ -482,7 +509,7 @@ function paintFilteredAppend(tab, newRows) {
 // follow-mode helpers ---------------------------------------------------------
 
 function scrollToTail(tab, { enableFollow = false } = {}) {
-  if (tab.levels) return;
+  if (hasLevelFilter(tab)) return;
   const target = Math.max(1, tab.totalLines - visibleCount() + 1);
   scroller.scrollTop = (target - 1) * rowH;
   renderWindow(tab, target);
@@ -600,7 +627,7 @@ function applyPoll(tab, res) {
       tab.lastLine = ev.totalLines;
       tab.totalLines = ev.totalLines;
       if (tab.follow && atBottom()) {
-        if (tab.levels) loadMoreFiltered(tab);
+        if (hasLevelFilter(tab)) loadMoreFiltered(tab);
         else {
           updateSpacer(tab);
           renderWindow(tab, Math.max(1, tab.totalLines - visibleCount() + 1));
@@ -625,7 +652,7 @@ function applyStats(tab, res) {
   tab.stats = res.stats;
   tab.totalLines = res.totalLines;
   tab.indexDone = res.indexDone;
-  if (!tab.levels) updateSpacer(tab);
+  if (!hasLevelFilter(tab)) updateSpacer(tab);
   updateBadges(tab);
   updateStatus(tab);
 }
@@ -648,9 +675,17 @@ function updateBadges(tab) {
   for (const el of $("badges").children) {
     const lv = el.dataset.level;
     el.querySelector("b").textContent = String(map[lv] || 0);
-    el.classList.toggle("on", Boolean(tab.levels && tab.levels.has(lv)));
+    const stateName = badgeState(tab, lv);
+    el.dataset.state = stateName;
+    el.classList.toggle("on", stateName === "include");
+    el.classList.toggle("exclude", stateName === "exclude");
+    el.title = stateName === "include" ? "仅显示此等级（再次点击改为排除）" : stateName === "exclude" ? "排除该等级（再次点击取消）" : "点击仅显示此等级";
   }
   const idx = $("idxProgress");
+  if (!tab || !tab.fileId) {
+    idx.textContent = "";
+    return;
+  }
   if (tab.indexDone) idx.textContent = "";
   else idx.textContent = `索引中 L${tab.totalLines}…`;
 }
@@ -662,7 +697,7 @@ function updateStatus(tab) {
     $("stSize").textContent = "";
     return;
   }
-  if (tab.levels) {
+  if (hasLevelFilter(tab)) {
     $("stPos").textContent = `过滤视图 ${tab.feedCount} 行`;
     $("stLines").textContent = `源文件已索引 L${tab.totalLines}${tab.indexDone ? "" : "+"}`;
   } else {
@@ -683,10 +718,6 @@ function startSearch() {
   const query = $("searchInput").value.trim();
   if (!query) return;
   const isRegex = $("cbRegex").checked;
-  if (isRegex && isUnsafeUserRegex(query)) {
-    toast("正则被拒绝：过长或含嵌套量词（可能灾难性回溯）");
-    return;
-  }
   const payload = {
     fileId: tab.fileId,
     query,
@@ -732,18 +763,25 @@ async function pollSearch(tab) {
 function updateSearchBar(tab) {
   const s = tab && tab.search;
   const el = $("searchState");
+  const prev = $("btnPrevMatch");
+  const next = $("btnNextMatch");
   if (!s) {
     el.textContent = "";
+    prev.disabled = true;
+    next.disabled = true;
     return;
   }
+  const navigable = Math.min(s.matchCount, s.stored || 0);
+  prev.disabled = navigable === 0;
+  next.disabled = navigable === 0;
   if (s.status === "running") {
-    el.textContent = "扫描中…";
+    el.textContent = `扫描中 · 已命中 ${s.matchCount}`;
   } else if (s.status === "cancelled") {
     el.textContent = "已取消";
   } else if (s.status === "error") {
     el.textContent = s.error || "搜索失败";
   } else {
-    const cur = s.current >= 0 ? ` · 第 ${s.current + 1} 处` : "";
+    const cur = s.current >= 0 ? ` · ${s.current + 1}/${navigable}` : "";
     const capNote = s.stored < s.matchCount ? `（仅定位前 ${s.stored} 处）` : "";
     el.innerHTML = "";
     const b = document.createElement("b");
@@ -753,8 +791,12 @@ function updateSearchBar(tab) {
 }
 
 function repaintCurrentWindow(tab) {
+  if (hasLevelFilter(tab)) {
+    renderFilteredViewport(tab);
+    return;
+  }
   if (!tab.window) return;
-  paintRows(tab, tab.levels ? tab.feedRows || [] : tab.window.lines, { absolute: !tab.levels });
+  paintRows(tab, hasLevelFilter(tab) ? tab.feedRows || [] : tab.window.lines, { absolute: !hasLevelFilter(tab) });
 }
 
 async function jumpMatch(tab, index) {
@@ -766,7 +808,7 @@ async function jumpMatch(tab, index) {
   }
   const stored = s.stored || 0;
   if (stored === 0) return;
-  index = Math.max(0, Math.min(index, stored - 1));
+  index = ((Math.floor(index) % stored) + stored) % stored;
   const windowStart = Math.max(0, index - 60);
   const res = await tab.adapter.searchMatches({ fileId: tab.fileId, jobId: s.jobId, offset: windowStart, limit: 160 });
   s.cache = { offset: windowStart, items: res.matches };
@@ -775,8 +817,20 @@ async function jumpMatch(tab, index) {
   s.currentLine = item ? item.line : null;
   updateSearchBar(tab);
   if (item) {
-    if (tab.levels) {
-      toast(`命中位于 L${item.line}（过滤视图中不可定位）`);
+    if (hasLevelFilter(tab)) {
+      let visibleIndex = (tab.feedRows || []).findIndex((row) => row.no === item.line);
+      for (let guard = 0; visibleIndex < 0 && guard < 100 && !tab.filterEof; guard += 1) {
+        const before = tab.feedRows ? tab.feedRows.length : 0;
+        await loadMoreFiltered(tab);
+        if ((tab.feedRows ? tab.feedRows.length : 0) === before) break;
+        visibleIndex = (tab.feedRows || []).findIndex((row) => row.no === item.line);
+      }
+      if (visibleIndex >= 0) {
+        scroller.scrollTop = Math.max(0, visibleIndex * rowH - scroller.clientHeight / 2);
+        renderFilteredViewport(tab);
+      } else {
+        toast(`命中位于 L${item.line}，不在当前等级过滤视图`);
+      }
     } else {
       scroller.scrollTop = Math.max(0, (item.line - 1) * rowH - scroller.clientHeight / 2);
       renderWindow(tab, item.line - Math.floor(visibleCount() / 2));
@@ -790,6 +844,52 @@ function clearSearch(tab) {
   tab.search = null;
   updateSearchBar(tab);
   repaintCurrentWindow(tab);
+}
+
+async function jumpToLine(tab, target) {
+  if (!tab || !Number.isInteger(target) || target < 1) return;
+  if (!hasLevelFilter(tab)) {
+    if (tab.indexDone && target > tab.totalLines) {
+      toast(`行号超出范围（共 ${tab.totalLines} 行）`);
+      return;
+    }
+    tab.lastLine = target;
+    scroller.scrollTop = (target - 1) * rowH;
+    renderWindow(tab, Math.max(1, target - Math.floor(visibleCount() / 2)));
+    return;
+  }
+  for (let guard = 0; guard < 100 && !tab.filterEof; guard += 1) {
+    const found = (tab.feedRows || []).findIndex((item) => item.no >= target);
+    if (found >= 0) {
+      scroller.scrollTop = Math.max(0, found * rowH - scroller.clientHeight / 2);
+      renderFilteredViewport(tab);
+      updateStatus(tab);
+      return;
+    }
+    const before = tab.feedRows ? tab.feedRows.length : 0;
+    await loadMoreFiltered(tab);
+    if ((tab.feedRows ? tab.feedRows.length : 0) === before) break;
+  }
+  const found = (tab.feedRows || []).findIndex((item) => item.no >= target);
+  if (found >= 0) {
+    scroller.scrollTop = Math.max(0, found * rowH - scroller.clientHeight / 2);
+    renderFilteredViewport(tab);
+  } else {
+    toast(`过滤视图中没有不小于 L${target} 的行`);
+  }
+}
+
+function promptJumpToLine() {
+  const tab = activeTab();
+  if (!tab) return;
+  const raw = window.prompt("跳转到行号", String(lineAtScroll()));
+  if (raw === null) return;
+  const target = Number(raw.trim());
+  if (!Number.isSafeInteger(target) || target < 1) {
+    toast("请输入正整数行号");
+    return;
+  }
+  jumpToLine(tab, target).catch((err) => toast(`跳转失败: ${err.message || err}`));
 }
 
 // ---------- tabs activation & view ------------------------------------------
@@ -807,7 +907,7 @@ function activateView() {
     updateFollowState(null);
     return;
   }
-  if (tab.levels) {
+  if (hasLevelFilter(tab)) {
     if (!tab.feedRows) renderFilteredReset(tab);
     else {
       tab.paintedFeed = tab.feedRows.length;
@@ -942,7 +1042,7 @@ function openDroppedFile(file) {
       if (tab && tab.search) {
         tab.search.status = m.status;
         tab.search.matchCount = m.matchCount || tab.search.matchCount;
-        tab.search.stored = tab.search.matchCount;
+        tab.search.stored = m.storedMatches ?? tab.search.stored;
         if (m.error) tab.search.error = m.error;
         updateSearchBar(tab);
       }
@@ -1026,11 +1126,12 @@ function bindEvents() {
   $("dirClose").addEventListener("click", () => $("dirOverlay").classList.remove("show"));
   $("dirCancel").addEventListener("click", () => $("dirOverlay").classList.remove("show"));
   $("dirOpen").addEventListener("click", openSelectedFiles);
+  $("btnJumpLine").addEventListener("click", promptJumpToLine);
 
   $("btnHead").addEventListener("click", () => {
     const tab = activeTab();
     if (!tab) return;
-    if (tab.levels) renderFilteredReset(tab);
+    if (hasLevelFilter(tab)) renderFilteredReset(tab);
     else {
       scroller.scrollTop = 0;
       renderWindow(tab, 1);
@@ -1038,7 +1139,7 @@ function bindEvents() {
   });
   $("btnTail").addEventListener("click", () => {
     const tab = activeTab();
-    if (!tab || tab.levels) return;
+    if (!tab || hasLevelFilter(tab)) return;
     scrollToTail(tab);
   });
   $("btnFollow").addEventListener("click", () => {
@@ -1054,6 +1155,11 @@ function bindEvents() {
     state.fontSize = Math.min(22, state.fontSize + 1);
     applyFont();
   });
+  $("fontFamilySel").value = state.fontFamily;
+  $("fontFamilySel").addEventListener("change", () => {
+    state.fontFamily = $("fontFamilySel").value;
+    applyFont();
+  });
   $("btnTheme").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     state.theme = next;
@@ -1062,6 +1168,14 @@ function bindEvents() {
   });
 
   $("btnSearch").addEventListener("click", startSearch);
+  $("btnPrevMatch").addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab && tab.search) jumpMatch(tab, (tab.search.current < 0 ? tab.search.stored : tab.search.current) - 1);
+  });
+  $("btnNextMatch").addEventListener("click", () => {
+    const tab = activeTab();
+    if (tab && tab.search) jumpMatch(tab, (tab.search.current < 0 ? -1 : tab.search.current) + 1);
+  });
   $("searchInput").addEventListener("keydown", (e) => {
     if (e.key === "Enter") startSearch();
   });
@@ -1072,11 +1186,20 @@ function bindEvents() {
       const tab = activeTab();
       if (!tab) return;
       const lv = el.dataset.level;
+      const current = badgeState(tab, lv);
       if (!tab.levels) tab.levels = new Set();
-      if (tab.levels.has(lv)) tab.levels.delete(lv);
-      else tab.levels.add(lv);
-      if (tab.levels.size === 0) tab.levels = null;
-      if (tab.levels) renderFilteredReset(tab);
+      if (!tab.excludedLevels) tab.excludedLevels = new Set();
+      if (current === "neutral") {
+        tab.levels.add(lv);
+      } else if (current === "include") {
+        tab.levels.delete(lv);
+        tab.excludedLevels.add(lv);
+      } else {
+        tab.excludedLevels.delete(lv);
+      }
+      if (!tab.levels.size) tab.levels = null;
+      if (!tab.excludedLevels.size) tab.excludedLevels = null;
+      if (hasLevelFilter(tab)) renderFilteredReset(tab);
       else {
         scroller.scrollTop = Math.max(0, (tab.lastLine - visibleCount()) * rowH);
         renderWindow(tab, Math.max(1, tab.lastLine - visibleCount() + 1));
@@ -1095,7 +1218,7 @@ function bindEvents() {
       .setEncoding({ fileId: tab.fileId, encoding: enc })
       .then(() => {
         tab.encoding = enc;
-        renderWindow(tab, tab.levels ? tab.feedFrom : lineAtScroll());
+        renderWindow(tab, hasLevelFilter(tab) ? tab.feedFrom : lineAtScroll());
         scheduleSaveState();
       })
       .catch((err) => toast(`切换编码失败: ${err.message || err}`));
@@ -1104,7 +1227,7 @@ function bindEvents() {
   scroller.addEventListener("scroll", () => {
     const tab = activeTab();
     if (!tab) return;
-    if (tab.levels) {
+    if (hasLevelFilter(tab)) {
       if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 80) {
         loadMoreFiltered(tab);
       }
@@ -1168,6 +1291,9 @@ function bindEvents() {
       e.preventDefault();
       $("searchInput").focus();
       $("searchInput").select();
+    } else if (mod && e.key.toLowerCase() === "g") {
+      e.preventDefault();
+      promptJumpToLine();
     } else if (e.key === "F3") {
       e.preventDefault();
       const tab = activeTab();
@@ -1199,6 +1325,7 @@ function scheduleSaveState() {
       encoding: t.encoding,
       follow: t.follow,
       levels: t.levels ? [...t.levels] : [],
+      excludeLevels: t.excludedLevels ? [...t.excludedLevels] : [],
     }));
     try {
       await invoke("engine.saveState", { tabs, active: state.tabs.findIndex((t) => t.id === state.activeId) });
@@ -1231,6 +1358,8 @@ async function boot() {
         tab.encoding = saved.encoding || "utf-8";
         tab.follow = Boolean(saved.follow);
         tab.levels = Array.isArray(saved.levels) && saved.levels.length ? new Set(saved.levels) : null;
+        tab.excludedLevels =
+          Array.isArray(saved.excludeLevels) && saved.excludeLevels.length ? new Set(saved.excludeLevels) : null;
         tab.lastLine = Math.max(1, saved.line || 1);
       } else {
         skipped += 1;
