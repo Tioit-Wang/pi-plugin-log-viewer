@@ -1,16 +1,15 @@
-# Host API proposals from the log viewer plugin
+# Host API integration from the log viewer plugin
 
-Two small host-side enhancements would let this plugin run fully inside the
-permission gateway. Both follow the existing plugin design logic: a user
-gesture grants reach, the grant is memory-only, the deny-list always wins,
-and every access is audited.
+The host-side enhancements below now have a plugin-side integration. Both
+follow the existing plugin design logic: a user gesture grants reach, the grant
+is memory-only, the deny-list always wins, and every access is audited.
 
 ## 1. Byte-range file read — filed as vastsa/PI-Desktop#90
 
-`fs.stat(path)` and `fs.readRange(path, byteOffset, length)` with exactly the
-`fs.read` permission semantics. See the issue for the full proposal. The
-plugin ships a feature-detected adapter and falls back to raw `node:fs` in
-the plugin process until this lands.
+`fs.stat(path)` and `fs.readRange(path, byteOffset, length)` use exactly the
+`fs.read` permission semantics. The plugin now uses these APIs for indexing,
+pagination, search, and follow; it fails closed when the host does not expose
+both methods.
 
 ## 2. Dropped-file grant (drag & drop into a plugin panel)
 
@@ -27,7 +26,7 @@ files inside the renderer (Web Worker + `Blob.slice`), which:
   the page); and
 - cannot serve tail follow, because the snapshot never sees appends.
 
-### Proposal
+### Host contract
 
 Two pieces, mirroring the `requestDirectory` model (§6.3 of the plugin
 security spec — "the user just pointed at it"):
@@ -59,9 +58,9 @@ security spec — "the user just pointed at it"):
    - is refused for deny-listed paths regardless of what the user dragged;
    - is audited like every other fs access.
 
-   With #90 landed, `fs.stat` / `fs.readRange` accept paths covered by a
-   drop grant, so the plugin process streams dropped files with the same
-   code path as picked files.
+   `fs.stat` / `fs.readRange` accept an absolute path only when accompanied by
+   the matching drop grant, so the plugin process streams dropped files with
+   the same code path as picked files.
 
 ### Why this fits the plugin design logic
 
@@ -76,8 +75,8 @@ security spec — "the user just pointed at it"):
 
 ### Alternatives considered
 
-- Renderer-side `Blob.slice` reading only (current v1 behavior): works, but
-  splits the engine in two and loses identity, tail, and persistence.
+- Renderer-side `Blob.slice` reading (the former v1 behavior): worked, but
+  split the engine in two and lost file identity and tail follow.
 - Exposing `File` objects over the bridge: structured clone cannot carry
   them through `contextBridge` cleanly, and the plugin process cannot read
   from a renderer-held blob without a proxy stream — more host machinery,
