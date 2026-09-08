@@ -28,6 +28,18 @@
       --hl-text: #ffe9a8;
       --current-bg: rgba(47, 181, 160, 0.12);
       --sel-row: rgba(255, 255, 255, 0.045);
+      --lv-error-bg: rgba(175, 48, 48, 0.24);
+      --lv-error-hover: rgba(196, 65, 65, 0.34);
+      --lv-error-fg: #ffaaa5;
+      --lv-warn-bg: rgba(177, 123, 30, 0.24);
+      --lv-warn-hover: rgba(205, 151, 44, 0.34);
+      --lv-warn-fg: #f6c66f;
+      --lv-info-bg: rgba(53, 111, 166, 0.24);
+      --lv-info-hover: rgba(70, 132, 193, 0.34);
+      --lv-info-fg: #9fc8f1;
+      --lv-debug-bg: rgba(126, 134, 147, 0.18);
+      --lv-debug-hover: rgba(150, 158, 171, 0.28);
+      --lv-debug-fg: #b8bec8;
     }
     :root[data-theme="light"] {
       --bg: #ffffff;
@@ -46,6 +58,18 @@
       --hl-text: #5c4400;
       --current-bg: rgba(14, 146, 128, 0.12);
       --sel-row: rgba(0, 0, 0, 0.04);
+      --lv-error-bg: #fde8e7;
+      --lv-error-hover: #f9d7d5;
+      --lv-error-fg: #9e2925;
+      --lv-warn-bg: #fff4d6;
+      --lv-warn-hover: #ffebbd;
+      --lv-warn-fg: #75500b;
+      --lv-info-bg: #e6f1fc;
+      --lv-info-hover: #d5e8fa;
+      --lv-info-fg: #1e568e;
+      --lv-debug-bg: #f0f1f3;
+      --lv-debug-hover: #e6e8eb;
+      --lv-debug-fg: #525b68;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; }
@@ -170,6 +194,9 @@
     .badge.lv-info b { color: var(--info); }
     .badge.lv-debug b { color: var(--debug); }
     .badge.on { background: var(--accent-dim); border-color: var(--accent); }
+    .badge.on::after { content: " +"; color: var(--accent); }
+    .badge.exclude { background: transparent; border-color: var(--error); color: var(--error); }
+    .badge.exclude::after { content: " −"; color: var(--error); }
     .idx-progress { color: var(--text-dim); font-size: 11px; white-space: nowrap; }
 
     /* search bar */
@@ -207,9 +234,12 @@
       font-size: var(--row-fs, 12px);
       line-height: var(--row-h);
       white-space: pre;
+      color: var(--row-fg, var(--text));
+      background: var(--row-bg, transparent);
     }
-    .row:hover { background: var(--sel-row); }
-    .row.current { background: var(--current-bg); }
+    .row:hover { background: var(--row-hover, var(--sel-row)); }
+    .row:hover .lno { background: var(--row-hover, var(--sel-row)); }
+    .row.current { background: var(--row-bg, var(--current-bg)); box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--accent); }
     .lno {
       position: sticky;
       left: 0;
@@ -218,7 +248,7 @@
       padding: 0 8px;
       text-align: right;
       color: var(--text-dim);
-      background: var(--bg);
+      background: var(--row-bg, var(--bg));
       border-right: 1px solid var(--border);
       cursor: pointer;
       user-select: none;
@@ -227,8 +257,10 @@
     .lno:hover { color: var(--accent); }
     .ltxt { padding: 0 12px; user-select: text; cursor: text; }
     .ltxt mark { background: var(--hl); color: var(--hl-text); border-radius: 2px; padding: 0 1px; }
-    .row.lv-error .ltxt { color: var(--error); }
-    .row.lv-warn .ltxt { color: var(--warn); }
+    .row.lv-error { --row-bg: var(--lv-error-bg); --row-hover: var(--lv-error-hover); --row-fg: var(--lv-error-fg); }
+    .row.lv-warn { --row-bg: var(--lv-warn-bg); --row-hover: var(--lv-warn-hover); --row-fg: var(--lv-warn-fg); }
+    .row.lv-info { --row-bg: var(--lv-info-bg); --row-hover: var(--lv-info-hover); --row-fg: var(--lv-info-fg); }
+    .row.lv-debug { --row-bg: var(--lv-debug-bg); --row-hover: var(--lv-debug-hover); --row-fg: var(--lv-debug-fg); }
 
     #jumpChip {
       position: absolute;
@@ -387,10 +419,19 @@
     <button id="btnOpenDir">打开文件</button>
     <button id="btnHead">头部</button>
     <button id="btnTail">尾部</button>
+    <button id="btnJumpLine">跳转行</button>
     <button id="btnFollow">实时跟随</button>
     <div class="sep"></div>
     <button id="btnFontDown" title="减小字号">A-</button>
     <button id="btnFontUp" title="增大字号">A+</button>
+    <select id="fontFamilySel" title="日志字体">
+      <option value="default">等宽字体（系统）</option>
+      <option value="Consolas, monospace">Consolas</option>
+      <option value='"Cascadia Mono", monospace'>Cascadia Mono</option>
+      <option value='"SF Mono", Menlo, monospace'>SF Mono / Menlo</option>
+      <option value='"JetBrains Mono", monospace'>JetBrains Mono</option>
+      <option value='"Fira Code", monospace'>Fira Code</option>
+    </select>
     <button id="btnTheme" title="切换主题">🌗</button>
   </div>
 
@@ -411,6 +452,8 @@
     <label><input type="checkbox" id="cbRegex" /> 正则</label>
     <label><input type="checkbox" id="cbCase" /> 区分大小写</label>
     <button id="btnSearch" class="primary">搜索全文</button>
+    <button id="btnPrevMatch" title="上一个命中（Shift+F3）">↑</button>
+    <button id="btnNextMatch" title="下一个命中（F3）">↓</button>
     <span class="search-state" id="searchState"></span>
     <div class="spacer"></div>
     <button id="btnSearchClose" title="清除搜索">✕</button>
@@ -462,6 +505,8 @@
   </div>
   <div id="toast"></div>
 
+  <script src="level.js"></script>
+  <script src="query.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
