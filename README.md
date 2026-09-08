@@ -9,16 +9,17 @@
   字节偏移），虚拟滚动渲染，内存占用与文件大小无关。
 - **实时跟随**：轮询文件增长自动追尾；向上翻阅自动暂停，滚回底部恢复；
   文件轮转（truncate / 重建）自动重载。
-- **全文搜索**：关键字/正则、大小写开关、异步扫描带进度可取消、
-  F3 / Shift+F3 命中导航、命中高亮。正则有长度与嵌套量词防护（防 ReDoS）。
-- **级别统计**：ERROR / WARN / INFO / DEBUG 全文计数徽章，点击进入级别
-  过滤视图（可多选）。
+- **全文搜索**：AND 关键字、`"短语"`、`-排除`、`level:error,warn`、
+  `-level:debug`、独立正则开关与大小写开关；异步扫描带进度可取消，
+  F3 / Shift+F3 和按钮循环导航，命中高亮。正则有长度与嵌套量词防护（防 ReDoS）。
+- **级别统计**：ERROR / WARN / INFO / DEBUG 全文计数徽章，点击按
+  **中性 → 包含 → 排除 → 中性** 循环；多个包含等级为 OR，排除优先，文本条件与等级条件为 AND。
 - **多文件页签**：一次多选打开多个日志；每页签独立记忆浏览位置、编码、
   跟随与过滤状态，重开面板续看上次位置（拖入文件除外，见下）。
 - **复制**：点击行号复制整行、右键菜单复制选中内容。
 - **编码**：UTF-8 / GBK / GB18030 按页签切换（行索引基于字节偏移，
   切换编码无需重建索引）。
-- **主题与字号**：明 / 暗主题（默认跟随宿主 `app.getAppearance`），日志字号可调。
+- **主题与外观**：明 / 暗主题（默认跟随宿主 `app.getAppearance`），日志字号和等宽字体可调。
 
 ## 使用
 
@@ -28,7 +29,15 @@
 3. 「打开文件」→ 选择日志所在目录（宿主授予）→ 在弹层中勾选一个或多个
    **文件**（仅列出该目录下的文件，不可进入子目录、不可返回上一级）→ 打开；
    或直接把 `.log` / `.txt` 拖入窗口。
-4. 快捷键：`Ctrl+F` 聚焦搜索、`F3` / `Shift+F3` 命中导航、`Esc` 退出输入。
+4. 快捷键：`Ctrl+F` 聚焦搜索、`F3` / `Shift+F3` 循环导航、`Ctrl+G` 跳转行号、`Esc` 退出输入。
+
+## 查询语法
+
+空格分隔的普通词是 AND；双引号包裹短语；反斜杠转义下一个字符（例如
+`"connection \\"refused\\""`）；未闭合引号会被拒绝。以 `-` 开头的词是排除条件。
+`level:error,warn` 表示等级 OR，`-level:debug` 表示排除 DEBUG。勾选「正则」后，
+每个文本词独立编译为正则，普通查询不会隐式变成正则；正则模式会保留 `\\d`、`\\s` 等正则转义，
+仅把引号、空格和反斜杠的转义用于查询分词。
 
 ## 权限
 
@@ -61,6 +70,7 @@ GB 级日志无法用宿主 API 分页读取，因此本插件的文件 IO 在�
 
 ```
 renderer/index.html + app.js     沙箱面板：虚拟滚动、页签、搜索交互、轮询
+renderer/level.js + query.js     native / worker 共用的等级识别与查询编译
 renderer/drop-worker.js          拖入文件的 Blob.slice 分块读取
         │ pluginBridge.invoke("engine.*")（宿主转发 → onPanelInvoke）
 main.js                          生命周期 + 通道分发
@@ -80,22 +90,34 @@ lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / ta
 ## 已知限制
 
 - 拖入文件为快照：不跟随增长、状态不持久化（等宿主拖拽授权落地）。
-- 级别过滤视图为顺序流式浏览，不支持按行号定位。
+- 级别过滤视图为顺序流式浏览；`Ctrl+G` 会定位到不小于目标行号的第一条可见过滤结果。
+- 过滤视图中的搜索命中会按原始行号加载并居中；如果命中行被等级过滤排除，则保留命中计数并提示其不在当前视图。
+- 等级识别优先读取 `|INFO|`、`[INFO]`、`level:INFO` 以及常见 Log4j / Logback / Python logging 前缀，
+  最后才使用整行 token fallback；没有显式等级的多行堆栈行按 `other` 处理，不继承上一行等级。
 - 搜索定位前 5000 处（计数完整）。
 - 单文件行长度截断 4000 字符；面板对宿主无感知的极长行（>16 MB 无换行）
   会强制断行。
 - 正则搜索会拒绝过长或含嵌套量词的表达式（防灾难性回溯）。
 - 无导出功能；可用行号点击 / 右键复制。
-- Ctrl+G 行号跳转、时间戳跳转、书签、columnizer、远程日志：规划中。
+- 时间戳跳转、书签、columnizer、远程日志：规划中。
 
 ## 开发
 
 ```bash
 # 语法检查
-node --check main.js && node --check lib/log-engine.js
+node --check main.js && node --check lib/log-engine.js && node --check renderer/app.js && node --check renderer/drop-worker.js
+
+# 单元测试（公共等级/查询解析、native engine 过滤与搜索）
+node --test test/log-viewer.test.js
 
 # 清单校验（在 PI-Desktop 仓库根目录）
 pnpm pi-plugin check F:\pi-plugin-log-viewer
 ```
+
+## 验收边界
+
+- 导出不属于当前版本范围；复制整行或选中内容是受支持的替代操作。
+- 拖入文件当前仍是 renderer worker 快照，不能跟随增长，也不会跨会话恢复。
+- 插件侧的宿主 `pi.fs.stat/readRange` 适配与拖拽授权需等待 PI-Desktop 宿主能力落地；在此之前保留受目录授权约束的 `node:fs` fallback。
 
 加载为开发插件后支持热重载（改动后约 300 ms 自动重载）。

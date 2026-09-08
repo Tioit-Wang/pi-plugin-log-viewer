@@ -1,5 +1,7 @@
 "use strict";
 
+importScripts("level.js", "query.js");
+
 /*
  * Drop worker — reads dragged-in File objects via Blob.slice so file bytes
  * never need to cross the plugin bridge. Mirrors lib/log-engine.js paging
@@ -15,17 +17,6 @@ const BLOCK_LINES = 512;
 const MAX_PENDING = 16 * 1024 * 1024;
 const MAX_LINE_CHARS = 4000;
 const MAX_STORED_MATCHES = 5000;
-
-const LEVEL_MAP = {
-  FATAL: "error",
-  ERROR: "error",
-  WARN: "warn",
-  WARNING: "warn",
-  INFO: "info",
-  DEBUG: "debug",
-  TRACE: "debug",
-};
-const LEVEL_RE = /\b(FATAL|ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\b/;
 
 let file = null; // { blob, name, size, encoding, readOffset, seqOffset, seqLines, seqDone, blocks, stats, pending, ring, chain }
 let job = null;
@@ -60,19 +51,11 @@ function indexTrailingLine(buf, bufStart) {
   if (lineNo === 1 || (lineNo - 1) % BLOCK_LINES === 0) {
     file.blocks.set(Math.floor((lineNo - 1) / BLOCK_LINES), bufStart);
   }
-  const m = LEVEL_RE.exec(line);
-  if (m) file.stats[LEVEL_MAP[m[1]]] += 1;
+  const level = LogLevel.detectLevel(line);
+  if (level) file.stats[level] += 1;
   file.ring.push({ no: lineNo, text: line });
   file.seqOffset += buf.length;
   file.seqLines += 1;
-}
-
-function isUnsafeRegex(source) {
-  if (!source || source.length > 200) return true;
-  return (
-    /\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)\s*(?:[*+]|\{\d+,?\d*\})/.test(source) ||
-    /(?:\[[^\]]*\]|\\[dws])\s*[*+]\s*(?:[*+]|\{\d+,?\d*\})/i.test(source)
-  );
 }
 
 async function seqStep(budget) {
@@ -136,8 +119,8 @@ async function seqStep(budget) {
       if (lineNo === 1 || (lineNo - 1) % BLOCK_LINES === 0) {
         file.blocks.set(Math.floor((lineNo - 1) / BLOCK_LINES), absStart);
       }
-      const m = LEVEL_RE.exec(line);
-      if (m) file.stats[LEVEL_MAP[m[1]]] += 1;
+      const level = LogLevel.detectLevel(line);
+      if (level) file.stats[level] += 1;
       file.ring.push({ no: lineNo, text: line });
     }
     file.seqOffset = bufStart + lastNl + 1;
@@ -160,7 +143,7 @@ async function ensureIndexedTo(lineNo) {
   return file.seqDone || file.seqLines >= lineNo;
 }
 
-async function jumpScan(fromLine, count, levelSet) {
+async function jumpScan(fromLine, count, levelFilter) {
   let b = Math.floor((fromLine - 1) / BLOCK_LINES);
   if (file.blocks.get(b) === undefined) {
     await ensureIndexedTo(b * BLOCK_LINES + 1);
@@ -180,7 +163,7 @@ async function jumpScan(fromLine, count, levelSet) {
       if (pending && pending.length) {
         const line = clip(decoder().decode(pending));
         scanned += 1;
-        if (lineNo >= fromLine && wants(line, levelSet) && collect.length < count) {
+        if (lineNo >= fromLine && wants(line, levelFilter) && collect.length < count) {
           collect.push({ no: lineNo, text: line });
         }
         lineNo += 1;
@@ -202,7 +185,7 @@ async function jumpScan(fromLine, count, levelSet) {
       if (chunk.length < CHUNK) {
         const line = clip(decoder().decode(buf));
         scanned += 1;
-        if (lineNo >= fromLine && wants(line, levelSet) && collect.length < count) {
+        if (lineNo >= fromLine && wants(line, levelFilter) && collect.length < count) {
           collect.push({ no: lineNo, text: line });
         }
         lineNo += 1;
@@ -212,7 +195,7 @@ async function jumpScan(fromLine, count, levelSet) {
       if (buf.length > MAX_PENDING) {
         scanned += 1;
         const line = clip(decoder().decode(buf));
-        if (lineNo >= fromLine && wants(line, levelSet) && collect.length < count) collect.push({ no: lineNo, text: line });
+        if (lineNo >= fromLine && wants(line, levelFilter) && collect.length < count) collect.push({ no: lineNo, text: line });
         lineNo += 1;
       } else {
         pending = buf.slice();
@@ -232,7 +215,7 @@ async function jumpScan(fromLine, count, levelSet) {
         file.blocks.set(Math.floor((lineNo - 1) / BLOCK_LINES), absStart);
       }
       scanned += 1;
-      if (lineNo >= fromLine && wants(line, levelSet) && collect.length < count) collect.push({ no: lineNo, text: line });
+      if (lineNo >= fromLine && wants(line, levelFilter) && collect.length < count) collect.push({ no: lineNo, text: line });
       lineNo += 1;
     }
     const rest = buf.subarray(lastNl + 1);
@@ -242,35 +225,25 @@ async function jumpScan(fromLine, count, levelSet) {
   return { lines: collect, eof: collect.length < count && scanned < maxScan && !pending, partial, nextLine: lineNo };
 }
 
-function wants(line, levelSet) {
-  if (!levelSet) return true;
-  const m = LEVEL_RE.exec(line);
-  return m ? levelSet.has(LEVEL_MAP[m[1]]) : levelSet.has("other");
+function wants(line, levelFilter) {
+  return LogQuery.matchesLevelFilter(line, levelFilter);
 }
 
 async function runSearch(jobObj) {
-  const { query, isRegex, caseSensitive } = jobObj;
-  let re = null;
-  let needle = null;
-  if (isRegex) {
-    if (isUnsafeRegex(query)) {
-      jobObj.status = "error";
-      jobObj.error = "regex rejected: too long or nested quantifiers";
-      post({ type: "searchStatus", jobId: jobObj.id, status: jobObj.status, error: jobObj.error });
-      return;
-    }
-    try {
-      re = new RegExp(query, caseSensitive ? "" : "i");
-    } catch (err) {
-      jobObj.status = "error";
-      jobObj.error = `invalid regex: ${err.message}`;
-      post({ type: "searchStatus", jobId: jobObj.id, status: jobObj.status, error: jobObj.error });
-      return;
-    }
-  } else {
-    needle = caseSensitive ? query : query.toLowerCase();
+  let matcher;
+  try {
+    matcher = LogQuery.compileQuery({
+      query: jobObj.query,
+      isRegex: jobObj.isRegex,
+      caseSensitive: jobObj.caseSensitive,
+    });
+  } catch (err) {
+    jobObj.status = "error";
+    jobObj.error = err.message;
+    post({ type: "searchStatus", jobId: jobObj.id, status: jobObj.status, error: jobObj.error, storedMatches: jobObj.matches.length });
+    return;
   }
-  const test = (line) => (re ? re.test(line) : caseSensitive ? line.includes(needle) : line.toLowerCase().includes(needle));
+  const test = matcher.test;
   let offset = 0;
   let lineNo = 1;
   let pending = null;
@@ -332,7 +305,7 @@ async function runSearch(jobObj) {
     const rest = buf.subarray(lastNl + 1);
     pending = rest.length ? rest.slice() : null;
     jobObj.scannedBytes = offset;
-    post({ type: "searchStatus", jobId: jobObj.id, status: jobObj.status, scannedBytes: jobObj.scannedBytes, matchCount: jobObj.matchCount });
+    post({ type: "searchStatus", jobId: jobObj.id, status: jobObj.status, scannedBytes: jobObj.scannedBytes, matchCount: jobObj.matchCount, storedMatches: jobObj.matches.length });
     await new Promise((r) => setTimeout(r, 0));
   }
   jobObj.status = jobObj.cancelled ? "cancelled" : "done";
@@ -343,6 +316,7 @@ async function runSearch(jobObj) {
     scannedBytes: jobObj.scannedBytes,
     matchCount: jobObj.matchCount,
     error: jobObj.error || null,
+    storedMatches: jobObj.matches.length,
   });
 }
 
@@ -398,11 +372,8 @@ self.onmessage = async (event) => {
         break;
       }
       case "page": {
-        let levelSet = null;
-        if (Array.isArray(msg.levels) && msg.levels.length && msg.levels.length < 5) {
-          levelSet = new Set(msg.levels.map(String));
-        }
-        const res = await jumpScan(Math.max(1, msg.fromLine | 0), Math.min(2000, Math.max(1, msg.count | 0)), levelSet);
+        const levelFilter = LogQuery.normaliseLevelFilter(msg.levels);
+        const res = await jumpScan(Math.max(1, msg.fromLine | 0), Math.min(2000, Math.max(1, msg.count | 0)), levelFilter);
         post({
           type: "paged",
           token: msg.token,
@@ -448,6 +419,7 @@ self.onmessage = async (event) => {
           matches: src.matches.slice(offset, offset + limit),
           matchCount: src.matchCount,
           status: src.status,
+          stored: src.matches.length,
         });
         break;
       }
