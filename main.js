@@ -39,7 +39,8 @@ async function onLoad() {
     title: "日志查看器：打开",
     keywords: ["log", "日志", "viewer", "tail"],
     run: async () => {
-      await pi.ui.openPanel({ title: "日志查看器" });
+      // 面板标题由 manifest.ui.title 双语字段提供，不要在此覆盖
+      await pi.ui.openPanel();
     },
   });
 }
