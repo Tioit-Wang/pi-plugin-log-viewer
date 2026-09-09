@@ -1,12 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const fsp = require("node:fs/promises");
-const os = require("node:os");
-const path = require("node:path");
 const test = require("node:test");
 
-const { LogEngine } = require("../lib/log-engine.js");
+const { LogEngine, createHostFileSystem } = require("../lib/log-engine.js");
 const { detectLevel } = require("../renderer/level.js");
 const { compileQuery, parseQuery } = require("../renderer/query.js");
 
@@ -15,6 +12,40 @@ test("level detection gives structured fields priority over message text", () =>
   assert.equal(detectLevel("2026-01-01 12:00:00 [main] ERROR module - boom"), "error");
   assert.equal(detectLevel("level:WARN request"), "warn");
   assert.equal(detectLevel("ordinary line without a level"), null);
+});
+
+test("engine streams host files through stat and bounded readRange", async () => {
+  const content = Buffer.from("INFO first\nERROR second\n", "utf8");
+  const calls = [];
+  const fsApi = {
+    stat: async (filePath, grantId) => {
+      calls.push(["stat", filePath, grantId]);
+      return { size: content.length, mtimeMs: 123, ino: 7, birthtimeMs: 123 };
+    },
+    readRange: async (filePath, byteOffset, length, grantId) => {
+      calls.push(["readRange", filePath, byteOffset, length, grantId]);
+      return {
+        bytes: content.subarray(byteOffset, byteOffset + length),
+        totalSize: content.length,
+      };
+    },
+    list: async () => ({ path: "", entries: [] }),
+  };
+  const engine = new LogEngine({
+    dataPath: null,
+    capabilities: { hostReadRange: true, hostStat: true },
+    fileSystem: createHostFileSystem(fsApi),
+  });
+  try {
+    await engine.setRoot({ path: "" });
+    const opened = await engine.openFile("logs/app.log");
+    const page = await engine.page({ fileId: opened.fileId, fromLine: 1, count: 2 });
+    assert.deepEqual(page.lines.map((line) => line.text), ["INFO first", "ERROR second"]);
+    assert.ok(calls.some(([kind]) => kind === "stat"));
+    assert.ok(calls.some(([kind, filePath]) => kind === "readRange" && filePath === "logs/app.log"));
+  } finally {
+    engine.dispose();
+  }
 });
 
 test("query grammar supports AND, phrases, exclusions, and level filters", () => {
@@ -40,22 +71,29 @@ test("query grammar supports AND, phrases, exclusions, and level filters", () =>
 });
 
 test("engine uses the same level filter and compiled query for native files", async () => {
-  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "log-viewer-test-"));
-  const filePath = path.join(root, "sample.log");
-  await fsp.writeFile(
-    filePath,
-    [
-      "2026-01-01|INFO|module|request returned ERROR text",
-      "2026-01-01|WARN|module|retrying",
-      "2026-01-01|DEBUG|module|details",
-      "plain connection refused message",
-      "2026-01-01|ERROR|module|database timeout",
-    ].join("\n"),
-  );
-  const engine = new LogEngine({ dataPath: root, capabilities: {} });
+  const content = Buffer.from([
+    "2026-01-01|INFO|module|request returned ERROR text",
+    "2026-01-01|WARN|module|retrying",
+    "2026-01-01|DEBUG|module|details",
+    "plain connection refused message",
+    "2026-01-01|ERROR|module|database timeout",
+  ].join("\n"));
+  const fsApi = {
+    stat: async () => ({ size: content.length, mtimeMs: 123, ino: 7, birthtimeMs: 123 }),
+    readRange: async (_filePath, byteOffset, length) => ({
+      bytes: content.subarray(byteOffset, byteOffset + length),
+      totalSize: content.length,
+    }),
+    list: async () => ({ path: "", entries: [] }),
+  };
+  const engine = new LogEngine({
+    dataPath: null,
+    capabilities: { hostReadRange: true, hostStat: true },
+    fileSystem: createHostFileSystem(fsApi),
+  });
   try {
-    await engine.setRoot({ path: root });
-    const opened = await engine.openFile(filePath);
+    await engine.setRoot({ path: "" });
+    const opened = await engine.openFile("sample.log");
     const filtered = await engine.page({
       fileId: opened.fileId,
       fromLine: 1,
@@ -81,6 +119,5 @@ test("engine uses the same level filter and compiled query for native files", as
     assert.deepEqual(matches.matches.map((match) => match.line), [5]);
   } finally {
     engine.dispose();
-    await fsp.rm(root, { recursive: true, force: true });
   }
 });

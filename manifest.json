@@ -26,7 +26,7 @@
     "read": { "root": "userSelected" }
   },
   "engines": {
-    "piDesktop": ">=0.8.0"
+    "piDesktop": ">=0.14.3"
   },
   "activationEvents": [
     "onCommand:log-viewer.open"

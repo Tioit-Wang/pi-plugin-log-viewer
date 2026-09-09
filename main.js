@@ -1,7 +1,7 @@
 "use strict";
 
 const path = require("node:path");
-const { LogEngine } = require("./lib/log-engine.js");
+const { LogEngine, createHostFileSystem } = require("./lib/log-engine.js");
 
 const COMMAND_ID = "log-viewer.open";
 let engine = null;
@@ -19,13 +19,21 @@ function detectCapabilities() {
 }
 
 async function onLoad() {
+  const capabilities = detectCapabilities();
+  if (!capabilities.hostReadRange || !capabilities.hostStat) {
+    throw new Error("PI-Desktop fs.stat and fs.readRange APIs are required");
+  }
   let dataPath = null;
   try {
     dataPath = await pi.plugin.getDataPath();
   } catch {
     dataPath = null; // state memory disabled without a data path
   }
-  engine = new LogEngine({ dataPath, capabilities: detectCapabilities() });
+  engine = new LogEngine({
+    dataPath,
+    capabilities,
+    fileSystem: createHostFileSystem(pi.fs),
+  });
   await pi.commands.register({
     id: COMMAND_ID,
     title: "大日志文件查看器：打开",

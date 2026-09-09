@@ -1,7 +1,6 @@
 "use strict";
 
-/* Large log viewer — panel UI. Two adapters (native bridge / drop worker)
- * expose the same operations, so the view logic is adapter-agnostic. */
+/* Large log viewer — panel UI. All file reads go through the host fs gateway. */
 
 const bridge = window.pluginBridge;
 const $ = (id) => document.getElementById(id);
@@ -95,60 +94,6 @@ function createNativeAdapter() {
     searchMatches: (p) => call("searchMatches", p),
     searchCancel: (p) => call("searchCancel", p),
     close: (p) => call("close", p),
-  };
-}
-
-function createDropAdapter(file, hooks) {
-  const worker = new Worker("drop-worker.js");
-  let seq = 1;
-  const pending = new Map();
-  worker.onmessage = (event) => {
-    const m = event.data || {};
-    const p = pending.get(m.token);
-    if (p) {
-      pending.delete(m.token);
-      if (m.type === "workerError") p.reject(new Error(m.message));
-      else p.resolve(m);
-      return;
-    }
-    if (m.type === "stats" && hooks.onStats) hooks.onStats(m);
-    if (m.type === "searchStatus" && hooks.onSearchStatus) hooks.onSearchStatus(m);
-  };
-  worker.onerror = (e) => toast(`拖入文件读取失败: ${e.message || "worker error"}`);
-  const request = (type, payload) =>
-    new Promise((resolve, reject) => {
-      const token = `t${seq++}`;
-      pending.set(token, { resolve, reject });
-      worker.postMessage({ type, token, ...(payload || {}) });
-      setTimeout(() => {
-        if (pending.has(token)) {
-          pending.delete(token);
-          reject(new Error("worker timeout"));
-        }
-      }, 60000);
-    });
-  return {
-    mode: "drop",
-    open: async () => request("open", { file }),
-    page: (p) => request("page", p),
-    poll: async (p) => request("stats", {}),
-    setFollow: async () => ({ ok: true }),
-    setEncoding: (p) => request("setEncoding", p),
-    stats: async () => request("stats", {}),
-    searchStart: (p) => request("searchStart", p),
-    searchStatus: async () => ({ status: "running" }),
-    searchMatches: (p) => request("searchMatches", p),
-    searchCancel: async () => {
-      worker.postMessage({ type: "searchCancel" });
-      return { ok: true };
-    },
-    searchResultEvents: null,
-    close: async () => {
-      worker.terminate();
-      return { ok: true };
-    },
-    _setSearchPush: null,
-    _pushes: hooks,
   };
 }
 
@@ -521,7 +466,7 @@ async function setFollow(tab, on) {
   try {
     await tab.adapter.setFollow({ fileId: tab.fileId, follow: tab.follow });
   } catch {
-    // drop adapter: noop
+    // The host owns the follow handle; a closed file is reported on poll.
   }
   updateFollowState(tab);
   if (tab.follow) scrollToTail(tab);
@@ -557,13 +502,6 @@ async function tick() {
         if (String(err && err.message).includes("not open")) {
           tab.error = "文件句柄已失效";
         }
-      }
-    } else if (tab.mode === "drop" && tab.id === state.activeId) {
-      try {
-        const res = await tab.adapter.stats({});
-        applyStats(tab, res);
-      } catch {
-        // worker gone
       }
     }
   }
@@ -938,15 +876,15 @@ async function openFilesFlow() {
     toast(`选择目录失败: ${err.message || err}`);
     return;
   }
-  if (!dir || !dir.path) return;
+  if (!dir) return;
   try {
-    await invoke("engine.setRoot", { path: dir.path });
+    await invoke("engine.setRoot", { path: "" });
   } catch (err) {
     toast(`绑定目录失败: ${err.message || err}`);
     return;
   }
-  dirCtx = { path: dir.path, selected: new Map() };
-  await loadFileList(dir.path);
+  dirCtx = { path: "", selected: new Map() };
+  await loadFileList("");
   $("dirOverlay").classList.add("show");
 }
 
@@ -956,7 +894,7 @@ async function loadFileList(path) {
   dirCtx.selected.clear();
   const list = $("fileList");
   list.textContent = "";
-  $("dirPath").textContent = res.path;
+  $("dirPath").textContent = res.path || "当前选择的目录";
   if (!res.entries.length) {
     const empty = document.createElement("div");
     empty.className = "f-row";
@@ -1031,38 +969,39 @@ async function openNativeFile(path) {
   }
 }
 
-function openDroppedFile(file) {
-  const hooks = {
-    onStats: (m) => {
-      const tab = state.tabs.find((t) => t.dropKey === key);
-      if (tab) applyStats(tab, m);
-    },
-    onSearchStatus: (m) => {
-      const tab = state.tabs.find((t) => t.dropKey === key);
-      if (tab && tab.search) {
-        tab.search.status = m.status;
-        tab.search.matchCount = m.matchCount || tab.search.matchCount;
-        tab.search.stored = m.storedMatches ?? tab.search.stored;
-        if (m.error) tab.search.error = m.error;
-        updateSearchBar(tab);
-      }
-    },
-  };
+async function openDroppedFile(file) {
   const key = `${file.name}:${file.size}`;
   const existing = state.tabs.find((t) => t.dropKey === key);
   if (existing) {
     activateTab(existing.id);
     return;
   }
-  const adapter = createDropAdapter(file, hooks);
-  const tab = createTab({ mode: "drop", name: file.name, adapter, saved: null });
+  const path = bridge.getDroppedFilePath(file);
+  if (!path) {
+    toast("无法解析拖入文件路径");
+    return;
+  }
+  let grant;
+  try {
+    grant = await bridge.invoke("fs.registerDropped", { path });
+  } catch (err) {
+    toast(`拖入文件授权失败: ${err.message || err}`);
+    return;
+  }
+  const adapter = createNativeAdapter();
+  const tab = createTab({ mode: "native", name: file.name, adapter, saved: null });
   tab.dropKey = key;
-  tab.size = file.size;
-  adapter
-    .open()
-    .then(() => {
+  invoke("engine.openDropped", { path, grantId: grant.grantId })
+    .then((res) => {
+      tab.fileId = res.fileId;
+      tab.path = null;
+      tab.size = res.size;
+      tab.totalLines = res.totalLines;
+      tab.indexDone = res.indexDone;
+      tab.encoding = res.encoding;
+      tab.stats = res.stats;
       activateTab(tab.id);
-      toast(`已打开拖入文件: ${file.name}（快照，不跟随更新）`);
+      toast(`已打开拖入文件: ${file.name}`);
     })
     .catch((err) => {
       toast(`拖入文件打开失败: ${err.message || err}`);

@@ -49,33 +49,25 @@
 
 ## 治理说明（重要）
 
-宿主 `pi.fs` 目前只有整文件 `readText`，没有字节范围读取与 `stat`（见
-[vastsa/PI-Desktop#90](https://github.com/vastsa/PI-Desktop/issues/90)）。
-GB 级日志无法用宿主 API 分页读取，因此本插件的文件 IO 在插件主进程
-（utilityProcess）内直接使用 `node:fs`，**绕过了权限网关的文件范围管控**。
-当前通过以下方式对冲：
+所有文件 IO 都经过宿主权限网关：大文件使用 `pi.fs.stat` 与有上限的
+`pi.fs.readRange` 分页读取，目录使用 `fs.requestDirectory` 授予的会话根。
+插件不再在主进程直接使用 `node:fs`，也不提供导出或写入能力。
 
-- 用户选择的目录（`fs.requestDirectory`）是唯一授权入口；引擎在
-  `setRoot` 后强制校验所有 `listDir` / `openFile` 路径（含 `realpath`）；
-- 选择器只列出该目录下的**文件**，不提供子目录浏览或返回上一级；
-- 只读打开（`r` 模式），不提供导出/写入；
-- `main.js` 内置能力探测：宿主落地 `fs.readRange` / `stat` 后，可切回
-  宿主 API（`engine.ping` 返回 `capabilities`）。
-
-拖入文件走渲染层 Web Worker 的 `Blob.slice` 读取（快照，无实时跟随，
-重开面板后需重新拖入）。对应的宿主增强提案见
+拖入文件时，面板 preload 解析用户拖入的本地路径，宿主只为这一个文件签发
+内存中的只读 grant。后续 `stat`、范围读取、轮询和搜索仍复用同一个引擎；
+grant 随插件进程结束而失效，不写入插件状态，也不能扩大到其他路径。宿主的
+保护路径和凭据拒绝规则始终优先。详见
 [docs/host-api-proposals.md](docs/host-api-proposals.md)。
 
 ## 架构
 
 ```
 renderer/index.html + app.js     沙箱面板：虚拟滚动、页签、搜索交互、轮询
-renderer/level.js + query.js     native / worker 共用的等级识别与查询编译
-renderer/drop-worker.js          拖入文件的 Blob.slice 分块读取
+renderer/level.js + query.js     等级识别与查询编译
         │ pluginBridge.invoke("engine.*")（宿主转发 → onPanelInvoke）
 main.js                          生命周期 + 通道分发
 lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / tail / 搜索
-        │ node:fs（见治理说明）
+        │ pi.fs.stat / pi.fs.readRange（宿主权限网关）
 ```
 
 - 行拆分基于原始字节（0x0A），UTF-8 / GBK / GB18030 均不会在多字节序列
@@ -84,12 +76,11 @@ lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / ta
   计数，不移动游标。
 - tail 增量通过小环形缓冲（4000 行）下发；客户端落后过多时收到
   `catchup` 信号并重新分页。
-- 文件末行即使没有结尾换行也会被索引；轮转时旧 `FileHandle` 等到在飞
-  读取结束后再关闭。
+- 文件末行即使没有结尾换行也会被索引；轮转时旧句柄会在切换后关闭。
 
 ## 已知限制
 
-- 拖入文件为快照：不跟随增长、状态不持久化（等宿主拖拽授权落地）。
+- 拖入文件的 grant 仅限当前插件进程，不跨会话持久化；文件本身支持跟随增长。
 - 级别过滤视图为顺序流式浏览；`Ctrl+G` 会定位到不小于目标行号的第一条可见过滤结果。
 - 过滤视图中的搜索命中会按原始行号加载并居中；如果命中行被等级过滤排除，则保留命中计数并提示其不在当前视图。
 - 等级识别优先读取 `|INFO|`、`[INFO]`、`level:INFO` 以及常见 Log4j / Logback / Python logging 前缀，
@@ -105,7 +96,7 @@ lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / ta
 
 ```bash
 # 语法检查
-node --check main.js && node --check lib/log-engine.js && node --check renderer/app.js && node --check renderer/drop-worker.js
+node --check main.js && node --check lib/log-engine.js && node --check renderer/app.js
 
 # 单元测试（公共等级/查询解析、native engine 过滤与搜索）
 node --test test/log-viewer.test.js
@@ -117,7 +108,8 @@ pnpm pi-plugin check F:\pi-plugin-log-viewer
 ## 验收边界
 
 - 导出不属于当前版本范围；复制整行或选中内容是受支持的替代操作。
-- 拖入文件当前仍是 renderer worker 快照，不能跟随增长，也不会跨会话恢复。
-- 插件侧的宿主 `pi.fs.stat/readRange` 适配与拖拽授权需等待 PI-Desktop 宿主能力落地；在此之前保留受目录授权约束的 `node:fs` fallback。
+- 目录选择、拖入文件、分页、搜索和跟随都使用宿主权限网关；拖入 grant
+  不跨插件进程持久化。
+- 运行要求 PI-Desktop 提供 `fs.stat`、`fs.readRange` 与面板拖拽路径授权能力。
 
 加载为开发插件后支持热重载（改动后约 300 ms 自动重载）。
