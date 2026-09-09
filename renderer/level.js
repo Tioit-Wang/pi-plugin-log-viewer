@@ -26,6 +26,24 @@
   const DELIMITED_RE = new RegExp(`(?:^|[|\\-])\\s*(${TOKEN})\\s*(?=[|\\-:]|$)`, "i");
   const FALLBACK_RE = new RegExp(`\\b(${TOKEN})\\b`, "i");
 
+  /** Uppercase delimited tokens — cheap indexOf fast path before regex. */
+  const QUICK_DELIMS = Object.freeze([
+    ["|ERROR|", "error"],
+    ["|FATAL|", "error"],
+    ["|WARN|", "warn"],
+    ["|WARNING|", "warn"],
+    ["|INFO|", "info"],
+    ["|DEBUG|", "debug"],
+    ["|TRACE|", "debug"],
+    ["[ERROR]", "error"],
+    ["[FATAL]", "error"],
+    ["[WARN]", "warn"],
+    ["[WARNING]", "warn"],
+    ["[INFO]", "info"],
+    ["[DEBUG]", "debug"],
+    ["[TRACE]", "debug"],
+  ]);
+
   function normalise(raw) {
     return raw ? LEVEL_MAP[String(raw).toUpperCase()] || null : null;
   }
@@ -42,6 +60,9 @@
    */
   function detectLevel(value) {
     const line = String(value || "");
+    for (let i = 0; i < QUICK_DELIMS.length; i += 1) {
+      if (line.includes(QUICK_DELIMS[i][0])) return QUICK_DELIMS[i][1];
+    }
     let level = find(line, PIPE_RE);
     if (level) return level;
     level = find(line, BRACKET_RE);

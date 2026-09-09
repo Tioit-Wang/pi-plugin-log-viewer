@@ -14,6 +14,15 @@ test("level detection gives structured fields priority over message text", () =>
   assert.equal(detectLevel("ordinary line without a level"), null);
 });
 
+test("level detection fast path handles pipe and bracket tokens", () => {
+  assert.equal(detectLevel("2026-09-08 00:00:03|INFO|handler:handle:42|url_path: /x"), "info");
+  assert.equal(detectLevel("2026-09-08|ERROR|db|connection failed"), "error");
+  assert.equal(detectLevel("[DEBUG] worker idle"), "debug");
+  assert.equal(detectLevel("[WARNING] disk almost full"), "warn");
+  // lowercase delimited token still hits the slow path and is detected
+  assert.equal(detectLevel("2026-01-01|info|module|ok"), "info");
+});
+
 test("engine streams host files through stat and bounded readRange", async () => {
   const content = Buffer.from("INFO first\nERROR second\n", "utf8");
   const calls = [];
@@ -117,6 +126,87 @@ test("engine uses the same level filter and compiled query for native files", as
     assert.equal(status.status, "done");
     const matches = await engine.searchMatches({ jobId, offset: 0, limit: 10 });
     assert.deepEqual(matches.matches.map((match) => match.line), [5]);
+  } finally {
+    engine.dispose();
+  }
+});
+
+function makeEngine(content) {
+  const buf = Buffer.from(content, "utf8");
+  const fsApi = {
+    stat: async () => ({ size: buf.length, mtimeMs: 1, ino: 9, birthtimeMs: 1 }),
+    readRange: async (_p, byteOffset, length) => ({
+      bytes: buf.subarray(byteOffset, byteOffset + length),
+      totalSize: buf.length,
+    }),
+    list: async () => ({ path: "", entries: [] }),
+  };
+  return new LogEngine({
+    dataPath: null,
+    capabilities: { hostReadRange: true, hostStat: true },
+    fileSystem: createHostFileSystem(fsApi),
+  });
+}
+
+test("engine text filter shows only matching lines and supports invert", async () => {
+  const engine = makeEngine(
+    [
+      "2026-01-01|INFO|app|start ok",
+      "2026-01-01|ERROR|app|database timeout",
+      "2026-01-01|INFO|app|request done",
+      "2026-01-01|WARN|app|slow query",
+      "2026-01-01|ERROR|app|connection refused",
+    ].join("\n"),
+  );
+  try {
+    await engine.setRoot({ path: "" });
+    const opened = await engine.openFile("filter.log");
+    await new Promise((r) => setTimeout(r, 20)); // let the driver index
+    const onlyErrors = await engine.page({
+      fileId: opened.fileId,
+      fromLine: 1,
+      count: 20,
+      filter: { query: "ERROR", isRegex: false, caseSensitive: true },
+    });
+    assert.deepEqual(onlyErrors.lines.map((l) => l.text), [
+      "2026-01-01|ERROR|app|database timeout",
+      "2026-01-01|ERROR|app|connection refused",
+    ]);
+
+    const hideErrors = await engine.page({
+      fileId: opened.fileId,
+      fromLine: 1,
+      count: 20,
+      filter: { query: "ERROR", isRegex: false, caseSensitive: true, invert: true },
+    });
+    assert.deepEqual(hideErrors.lines.map((l) => l.no), [1, 3, 4]);
+
+    const combined = await engine.page({
+      fileId: opened.fileId,
+      fromLine: 1,
+      count: 20,
+      levels: { include: ["error"], exclude: [] },
+      filter: { query: "database", isRegex: false, caseSensitive: false },
+    });
+    assert.deepEqual(combined.lines.map((l) => l.no), [2]);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test("poll after open does not treat existing lines as new when client is synced", async () => {
+  const engine = makeEngine("line one\nline two\nline three\n");
+  try {
+    await engine.setRoot({ path: "" });
+    const opened = await engine.openFile("static.log");
+    // Sync as the renderer does after open: last seen = whatever is indexed now.
+    const first = await engine.poll({ fileId: opened.fileId, sinceLine: opened.totalLines || 0 });
+    // After indexing catch-up, a client that tracks totalLines should not get a gap.
+    const synced = await engine.poll({ fileId: opened.fileId, sinceLine: first.totalLines });
+    const append = (synced.events || []).filter((e) => e.type === "append");
+    assert.equal(append.length, 0);
+    assert.equal(synced.indexDone, true);
+    assert.equal(synced.totalLines, 3);
   } finally {
     engine.dispose();
   }

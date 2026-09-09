@@ -1,14 +1,15 @@
 {
   "schemaVersion": 1,
-  "id": "local.log-viewer",
-  "name": "大日志文件查看器",
-  "version": "0.1.0",
-  "description": "Paged streaming log viewer for very large files: virtual scroll, tail follow, regex search, level stats.",
+  "id": "pi.log-viewer",
+  "name": "Log Viewer",
+  "version": "0.2.0",
+  "description": "大日志文件查看器：GB 级流式分页、虚拟滚动、实时跟随、搜索高亮、文本/等级过滤、钉住对比。Log viewer for huge files: paging, tail, search, filter, pin.",
   "author": "Tioit-Wang",
+  "categories": ["developer-tools", "productivity"],
   "main": "main.js",
   "ui": {
     "panel": "renderer/index.html",
-    "title": "大日志文件查看器",
+    "title": "日志查看器",
     "width": 1280,
     "height": 832
   },
@@ -16,8 +17,8 @@
     "commands": [
       {
         "id": "log-viewer.open",
-        "title": "大日志文件查看器：打开",
-        "keywords": ["log", "日志", "viewer", "tail"]
+        "title": "日志查看器：打开",
+        "keywords": ["log", "日志", "viewer", "tail", "filter"]
       }
     ]
   },
