@@ -36,10 +36,10 @@ async function onLoad() {
   });
   await pi.commands.register({
     id: COMMAND_ID,
-    title: "大日志文件查看器：打开",
+    title: "日志查看器：打开",
     keywords: ["log", "日志", "viewer", "tail"],
     run: async () => {
-      await pi.ui.openPanel({ title: "大日志文件查看器" });
+      await pi.ui.openPanel({ title: "日志查看器" });
     },
   });
 }
