@@ -129,3 +129,10 @@ pnpm pi-plugin check F:\pi-plugin-log-viewer
 - 运行要求 PI-Desktop 提供 `fs.stat`、`fs.readRange` 与面板拖拽路径授权能力。
 
 加载为开发插件后支持热重载（改动后约 300 ms 自动重载）。
+
+## 社区
+
+本插件在 [LINUX DO](https://linux.do/) 社区分享与讨论，欢迎佬友反馈：
+
+- 宿主项目讨论帖：[【PI-Desktop】两个月，300 亿 Token，终于把自己想要的 Agent 桌面端搓出来了](https://linux.do/t/topic/2869113)
+- 社区入口：[https://linux.do](https://linux.do/)
