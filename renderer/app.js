@@ -361,28 +361,40 @@ function computeDemoStats(lines) {
   return stats;
 }
 
-function demoMatchesFilters(line, { levels, filter }) {
+/** 每次分页预编译一次过滤谓词，避免逐行重建 Set / 正则。 */
+function makeDemoPredicate({ levels, filter }) {
+  let include = null;
+  let exclude = null;
   if (levels) {
-    const lv = LogLevel.levelFromLine(line);
-    const include = new Set(levels.include || []);
-    const exclude = new Set(levels.exclude || []);
-    if (exclude.has(lv)) return false;
-    if (include.size && !include.has(lv)) return false;
+    include = new Set(levels.include || []);
+    exclude = new Set(levels.exclude || []);
   }
+  let matcher = null;
+  let invert = false;
   if (filter && filter.query) {
     try {
-      const matcher = LogQuery.compileQuery({
+      matcher = LogQuery.compileQuery({
         query: filter.query,
         isRegex: Boolean(filter.isRegex),
         caseSensitive: Boolean(filter.caseSensitive),
       });
-      const hit = matcher.test(line);
-      if (filter.invert ? hit : !hit) return false;
+      invert = Boolean(filter.invert);
     } catch {
-      return true; // 非法查询时不过滤，避免空白
+      matcher = null; // 非法查询时不过滤，避免空白
     }
   }
-  return true;
+  return (line) => {
+    if (exclude) {
+      const lv = LogLevel.levelFromLine(line);
+      if (exclude.has(lv)) return false;
+      if (include && include.size && !include.has(lv)) return false;
+    }
+    if (matcher) {
+      const hit = matcher.test(line);
+      if (invert ? hit : !hit) return false;
+    }
+    return true;
+  };
 }
 
 function createDemoAdapter() {
@@ -403,7 +415,7 @@ function createDemoAdapter() {
     page: async (p) => {
       const from = Math.max(1, Math.floor(Number(p.fromLine) || 1));
       const count = Math.min(2000, Math.max(1, Math.floor(Number(p.count) || 500)));
-      const filters = { levels: p.levels || null, filter: p.filter || null };
+      const pred = makeDemoPredicate({ levels: p.levels || null, filter: p.filter || null });
       const out = [];
       let scanned = 0;
       let next = from;
@@ -411,7 +423,7 @@ function createDemoAdapter() {
         scanned += 1;
         next = i + 2;
         const text = lines[i];
-        if (demoMatchesFilters(text, filters)) out.push({ no: i + 1, text });
+        if (pred(text)) out.push({ no: i + 1, text });
       }
       const eof = next > lines.length;
       return {
@@ -821,9 +833,10 @@ async function loadMoreFiltered(tab) {
   tab.loadingMore = true;
   try {
     for (let guard = 0; guard < 30; guard += 1) {
+      const scanFrom = tab.feedFrom;
       const res = await tab.adapter.page({
         fileId: tab.fileId,
-        fromLine: tab.feedFrom,
+        fromLine: scanFrom,
         count: Math.max(visibleCount() * 2, 80),
         ...pageFilters(tab),
       });
@@ -837,17 +850,20 @@ async function loadMoreFiltered(tab) {
       const newRows = merged.slice(existing.length);
       tab.feedRows = merged;
       tab.feedCount = merged.length;
-      tab.feedFrom = merged.length ? merged[merged.length - 1].no + 1 : res.scanEndLine || tab.feedFrom;
-      tab.filterEof = Boolean(res.eof);
+      // 扫描游标指向「下一个未扫描行」而非「最后一个命中行 +1」：
+      // 避免重扫已排除的区间，也是 follow 追尾时解锁 filterEof 的依据。
+      const nextScan = res.scanEndLine || scanFrom;
+      tab.feedFrom = nextScan;
+      tab.feedScanFrom = nextScan;
+      tab.filterEof = Boolean(res.eof) && !res.scanError;
       tab._fpaintKey = null;
       updateSpacer(tab);
       renderFilteredViewport(tab);
       updateBadges(tab);
       updateStatus(tab);
-      if (res.eof) break;
+      if (tab.filterEof) break;
       if (newRows.length > 0) break; // painted content; wait for the next scroll
-      if (!res.scanEndLine || res.scanEndLine <= tab.feedFrom) break; // no progress
-      tab.feedFrom = res.scanEndLine; // empty window: keep scanning
+      if (nextScan <= scanFrom) break; // no progress (read error or index lag)
     }
   } catch (err) {
     toast(`过滤视图加载失败: ${err.message || err}`);
@@ -959,7 +975,9 @@ function applyPoll(tab, res) {
     tab.lastLine = 0;
     tab.search = null;
     updateSearchBar(tab);
-    if (tab.follow) {
+    if (hasViewFilter(tab)) {
+      renderFilteredReset(tab); // 过滤视图从新文件重建
+    } else if (tab.follow) {
       renderWindow(tab, 1);
       setTimeout(() => scrollToTail(tab), 600);
     } else {
@@ -975,8 +993,14 @@ function applyPoll(tab, res) {
       tab.lastLine = ev.totalLines;
       tab.totalLines = ev.totalLines;
       if (tab.follow && atBottom()) {
-        if (hasViewFilter(tab)) loadMoreFiltered(tab);
-        else {
+        if (hasViewFilter(tab)) {
+          // 过滤视图曾扫到 EOF：只有新行落盘才解锁继续加载。
+          if (tab.filterEof && (tab.feedScanFrom || 0) < ev.totalLines) {
+            tab.filterEof = false;
+            tab.feedFrom = Math.max(tab.feedFrom || 1, tab.feedScanFrom || 1);
+          }
+          loadMoreFiltered(tab);
+        } else {
           updateSpacer(tab);
           renderWindow(tab, Math.max(1, tab.totalLines - visibleCount() + 1));
         }
@@ -1413,7 +1437,7 @@ function openViaNativeFilePicker() {
   input.click();
 }
 
-/** 宿主无拖入/选文件路径解析时的回退：选目录后只列出 .log / .txt。 */
+/** 宿主无法解析文件路径时的回退：选目录 → 原生列出 .log / .txt。 */
 async function openViaDirectoryFallback() {
   let dir;
   try {
@@ -1423,14 +1447,18 @@ async function openViaDirectoryFallback() {
     return;
   }
   if (!dir) return;
-  try {
-    await invoke("engine.setRoot", { path: "" });
-  } catch (err) {
-    toast(`绑定目录失败: ${err.message || err}`);
+  const dirPath = typeof dir === "string" ? dir : dir && (dir.path || dir.dirPath || dir.root);
+  if (!dirPath) {
+    toast("宿主未返回目录路径，请直接拖入 .log / .txt 文件");
     return;
   }
-  dirCtx = { path: "", selected: new Map() };
-  await loadFileList("");
+  dirCtx = { path: dirPath, selected: new Map() };
+  try {
+    await loadFileList(dirPath);
+  } catch (err) {
+    toast(`读取目录失败: ${err.message || err}`);
+    return;
+  }
   $("dirOverlay").classList.add("show");
 }
 
@@ -1513,17 +1541,19 @@ function openDemoLog() {
   return tab;
 }
 
-async function openNativeFile(path) {
+async function openNativeFile(path, { name, dropKey } = {}) {
   try {
     const res = await invoke("engine.openFile", { path });
     const existing = state.tabs.find((t) => t.mode === "native" && t.path === path);
     if (existing) {
       existing.fileId = res.fileId;
+      if (dropKey) existing.dropKey = existing.dropKey || dropKey;
       activateTab(existing.id);
       return existing;
     }
-    const tab = createTab({ mode: "native", name: res.name, path, adapter: createNativeAdapter() });
+    const tab = createTab({ mode: "native", name: name || res.name, path, adapter: createNativeAdapter() });
     tab.fileId = res.fileId;
+    if (dropKey) tab.dropKey = dropKey;
     tab.size = res.size;
     tab.seenSize = res.size;
     tab.totalLines = res.totalLines;
@@ -1541,7 +1571,7 @@ async function openNativeFile(path) {
   }
 }
 
-/** 选择器 / 拖入共用：解析本地路径 → 注册 grant → 打开。 */
+/** 选择器 / 拖入共用：解析本地路径 → 引擎原生打开（无需宿主授权）。 */
 async function openPickedOrDroppedFile(file, { source = "drop" } = {}) {
   const key = `${file.name}:${file.size}`;
   const existing = state.tabs.find((t) => t.dropKey === key);
@@ -1562,36 +1592,9 @@ async function openPickedOrDroppedFile(file, { source = "drop" } = {}) {
     toast(source === "picker" ? "无法解析所选文件路径" : "无法解析拖入文件路径");
     return null;
   }
-  let grant;
-  try {
-    grant = await bridge.invoke("fs.registerDropped", { path });
-  } catch (err) {
-    toast(`${source === "picker" ? "打开" : "拖入"}文件授权失败: ${err.message || err}`);
-    return null;
-  }
-  const adapter = createNativeAdapter();
-  const tab = createTab({ mode: "native", name: file.name, adapter, saved: null });
-  tab.dropKey = key;
-  try {
-    const res = await invoke("engine.openDropped", { path, grantId: grant.grantId });
-    tab.fileId = res.fileId;
-    tab.path = path; // 记录绝对路径，便于会话内展示
-    tab.size = res.size;
-    tab.seenSize = res.size;
-    tab.totalLines = res.totalLines;
-    tab.indexDone = res.indexDone;
-    tab.encoding = res.encoding;
-    tab.stats = res.stats;
-    tab.lastLine = Math.max(0, res.totalLines || 0);
-    tab.viewLine = 1;
-    activateTab(tab.id);
-    toast(source === "picker" ? `已打开: ${file.name}` : `已打开拖入文件: ${file.name}`);
-    return tab;
-  } catch (err) {
-    toast(`打开失败: ${err.message || err}`);
-    closeTab(tab.id);
-    return null;
-  }
+  const tab = await openNativeFile(path, { name: file.name, dropKey: key });
+  if (tab) toast(source === "picker" ? `已打开: ${file.name}` : `已打开拖入文件: ${file.name}`);
+  return tab;
 }
 
 async function openDroppedFile(file) {
@@ -2024,25 +2027,25 @@ let saveTimer = null;
 function scheduleSaveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    const tabs = state.tabs
-      .filter((t) => t.mode !== "demo")
-      .map((t) => ({
-        mode: t.mode,
-        path: t.path,
-        name: t.name,
-        size: t.size,
-        line: Math.max(1, t.viewLine || t.lastLine || 1),
-        encoding: t.encoding,
-        follow: t.follow,
-        levels: t.levels ? [...t.levels] : [],
-        excludeLevels: t.excludedLevels ? [...t.excludedLevels] : [],
-        filterQuery: t.filter && t.filter.query ? t.filter.query : "",
-        filterIsRegex: Boolean(t.filter && t.filter.isRegex),
-        filterCaseSensitive: Boolean(t.filter && t.filter.caseSensitive),
-        filterInvert: Boolean(t.filter && t.filter.invert),
-      }));
+    const savedTabs = state.tabs.filter((t) => t.mode !== "demo");
+    const tabs = savedTabs.map((t) => ({
+      mode: t.mode,
+      path: t.path,
+      name: t.name,
+      size: t.size,
+      line: Math.max(1, t.viewLine || t.lastLine || 1),
+      encoding: t.encoding,
+      follow: t.follow,
+      levels: t.levels ? [...t.levels] : [],
+      excludeLevels: t.excludedLevels ? [...t.excludedLevels] : [],
+      filterQuery: t.filter && t.filter.query ? t.filter.query : "",
+      filterIsRegex: Boolean(t.filter && t.filter.isRegex),
+      filterCaseSensitive: Boolean(t.filter && t.filter.caseSensitive),
+      filterInvert: Boolean(t.filter && t.filter.invert),
+    }));
     try {
-      await invoke("engine.saveState", { tabs, active: state.tabs.findIndex((t) => t.id === state.activeId) });
+      // active 必须相对保存后的列表计算：demo 页签不落盘，混算会错位。
+      await invoke("engine.saveState", { tabs, active: savedTabs.findIndex((t) => t.id === state.activeId) });
     } catch {
       // state saving is best-effort
     }

@@ -31,9 +31,8 @@
 1. 将本目录作为开发插件载入 PI-Desktop（Plugins → Load development
    plugin）。
 2. 全局搜索执行命令「日志查看器：打开」，或直接打开插件面板。
-3. 「打开文件」→ 选择日志所在目录（宿主授予）→ 在弹层中勾选一个或多个
-   **文件**（仅列出该目录下的文件，不可进入子目录、不可返回上一级）→ 打开；
-   或直接把 `.log` / `.txt` 拖入窗口。
+3. 点击「＋」或「打开日志」→ 系统文件选择器多选 `.log` / `.txt` 直接打开；
+    或直接把文件拖入窗口。宿主无法解析所选路径时回退为「选目录 → 列出日志」。
 4. 快捷键：`Ctrl+F` 聚焦搜索、`Ctrl+Shift+F` 聚焦过滤、`F3` / `Shift+F3` 循环导航、
    `Ctrl+G` 跳转行号、`Esc` 退出输入。
 
@@ -60,20 +59,18 @@
 | 权限 | 用途 |
 |---|---|
 | `ui.panel` | 面板窗口 |
-| `fs.read`（root: userSelected） | 触发目录选择器（`fs.requestDirectory`），作为打开文件的会话授权根 |
 | `clipboard.write` | 复制整行 / 选中内容 |
+| `fs.read`（root: userSelected） | 仅用于目录回退流程：`fs.requestDirectory` 弹出系统目录选择器 |
 
 ## 治理说明（重要）
 
-所有文件 IO 都经过宿主权限网关：大文件使用 `pi.fs.stat` 与有上限的
-`pi.fs.readRange` 分页读取，目录使用 `fs.requestDirectory` 授予的会话根。
-插件不再在主进程直接使用 `node:fs`，也不提供导出或写入能力。
+所有文件 IO 都在插件进程内用原生 `node:fs` 完成：`fs.promises.open` 只读句柄
+负责 `stat` / 范围读取 / 轮转重开，目录列表用 `readdir`。宿主只负责把用户
+手势解析成路径——文件选择器与拖入由面板 preload 的 `getDroppedFilePath`
+解析，目录回退走 `fs.requestDirectory`；读取阶段不再依赖任何宿主 fs grant。
 
-拖入文件时，面板 preload 解析用户拖入的本地路径，宿主只为这一个文件签发
-内存中的只读 grant。后续 `stat`、范围读取、轮询和搜索仍复用同一个引擎；
-grant 随插件进程结束而失效，不写入插件状态，也不能扩大到其他路径。宿主的
-保护路径和凭据拒绝规则始终优先。详见
-[docs/host-api-proposals.md](docs/host-api-proposals.md)。
+上一版基于 `pi.fs.stat` / `pi.fs.readRange` 的权限网关方案见
+[docs/host-api-proposals.md](docs/host-api-proposals.md)（历史设计记录）。
 
 ## 架构
 
@@ -83,7 +80,7 @@ renderer/level.js + query.js     等级识别与查询编译
         │ pluginBridge.invoke("engine.*")（宿主转发 → onPanelInvoke）
 main.js                          生命周期 + 通道分发
 lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / tail / 搜索
-        │ pi.fs.stat / pi.fs.readRange（宿主权限网关）
+         │ node:fs（插件进程内原生 IO：open / stat / read / readdir）
 ```
 
 - 行拆分基于原始字节（0x0A），UTF-8 / GBK / GB18030 均不会在多字节序列
@@ -96,7 +93,7 @@ lib/log-engine.js                顺序索引游标 / 稀疏块偏移跳读 / ta
 
 ## 已知限制
 
-- 拖入文件的 grant 仅限当前插件进程，不跨会话持久化；文件本身支持跟随增长。
+- 拖入 / 选择器打开的文件仅限当前插件进程内访问，不跨会话持久化；文件本身支持跟随增长。
 - 过滤视图（等级或文本）为顺序流式浏览 + 虚拟滚动；`Ctrl+G` 会定位到不小于目标行号的第一条可见过滤结果。
 - 过滤视图中的搜索命中会按原始行号加载并居中；如果命中行被过滤条件排除，则保留命中计数并提示其不在当前视图。
 - 等级识别优先读取 `|INFO|`、`[INFO]`、`level:INFO` 以及常见 Log4j / Logback / Python logging 前缀，

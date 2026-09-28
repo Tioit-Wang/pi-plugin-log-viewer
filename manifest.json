@@ -2,14 +2,26 @@
   "schemaVersion": 1,
   "id": "pi.log-viewer",
   "name": "Log Viewer",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "大日志文件查看器：GB 级流式分页、虚拟滚动、实时跟随、搜索高亮、文本/等级过滤、钉住对比。Log viewer for huge files: paging, tail, search, filter, pin.",
   "author": "Tioit-Wang",
   "categories": ["developer-tools", "productivity"],
   "main": "main.js",
+  "i18n": {
+    "en": {
+      "name": "Log Viewer",
+      "description": "Large log file viewer: GB-scale streaming paging, virtual scrolling, live tail-follow, search highlight, text/level filters and pinned lines.",
+      "safetyNotes": "Opens only the .log/.txt files you pick or drag in, reads them read-only inside the plugin process; writes nothing and performs no network calls."
+    },
+    "zh-CN": {
+      "name": "日志查看器",
+      "description": "大日志文件查看器：GB 级流式分页、虚拟滚动、实时跟随、搜索高亮、文本/等级过滤、钉住对比。",
+      "safetyNotes": "仅打开你选择或拖入的 .log / .txt 文件，在插件进程内只读访问；不写入文件，不发起网络请求。"
+    }
+  },
   "ui": {
     "panel": "renderer/index.html",
-    "title": "日志查看器",
+    "title": { "en": "Log Viewer", "zh-CN": "日志查看器" },
     "width": 1280,
     "height": 832
   },

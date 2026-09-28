@@ -2,10 +2,20 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
 
-const { LogEngine, createHostFileSystem } = require("../lib/log-engine.js");
+const { LogEngine } = require("../lib/log-engine.js");
 const { detectLevel } = require("../renderer/level.js");
 const { compileQuery, parseQuery } = require("../renderer/query.js");
+
+async function makeTempFile(name, content) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "log-viewer-test-"));
+  const file = path.join(dir, name);
+  await fs.writeFile(file, Buffer.from(content, "utf8"));
+  return file;
+}
 
 test("level detection gives structured fields priority over message text", () => {
   assert.equal(detectLevel("2026-01-01|INFO|module|request returned ERROR text"), "info");
@@ -23,35 +33,18 @@ test("level detection fast path handles pipe and bracket tokens", () => {
   assert.equal(detectLevel("2026-01-01|info|module|ok"), "info");
 });
 
-test("engine streams host files through stat and bounded readRange", async () => {
-  const content = Buffer.from("INFO first\nERROR second\n", "utf8");
-  const calls = [];
-  const fsApi = {
-    stat: async (filePath, grantId) => {
-      calls.push(["stat", filePath, grantId]);
-      return { size: content.length, mtimeMs: 123, ino: 7, birthtimeMs: 123 };
-    },
-    readRange: async (filePath, byteOffset, length, grantId) => {
-      calls.push(["readRange", filePath, byteOffset, length, grantId]);
-      return {
-        bytes: content.subarray(byteOffset, byteOffset + length),
-        totalSize: content.length,
-      };
-    },
-    list: async () => ({ path: "", entries: [] }),
-  };
-  const engine = new LogEngine({
-    dataPath: null,
-    capabilities: { hostReadRange: true, hostStat: true },
-    fileSystem: createHostFileSystem(fsApi),
-  });
+test("engine streams native fs files through open/stat/read", async () => {
+  const file = await makeTempFile("app.log", "INFO first\nERROR second\n");
+  const engine = new LogEngine({ dataPath: null });
   try {
-    await engine.setRoot({ path: "" });
-    const opened = await engine.openFile("logs/app.log");
-    const page = await engine.page({ fileId: opened.fileId, fromLine: 1, count: 2 });
+    const opened = await engine.openFile(file);
+    const page = await engine.page({ fileId: opened.fileId, fromLine: 1, count: 5 });
+    assert.equal(opened.name, "app.log");
     assert.deepEqual(page.lines.map((line) => line.text), ["INFO first", "ERROR second"]);
-    assert.ok(calls.some(([kind]) => kind === "stat"));
-    assert.ok(calls.some(([kind, filePath]) => kind === "readRange" && filePath === "logs/app.log"));
+    assert.equal(page.eof, true);
+    // opening the same path again dedupes to the same engine file
+    const again = await engine.openFile(file);
+    assert.equal(again.fileId, opened.fileId);
   } finally {
     engine.dispose();
   }
@@ -80,29 +73,19 @@ test("query grammar supports AND, phrases, exclusions, and level filters", () =>
 });
 
 test("engine uses the same level filter and compiled query for native files", async () => {
-  const content = Buffer.from([
-    "2026-01-01|INFO|module|request returned ERROR text",
-    "2026-01-01|WARN|module|retrying",
-    "2026-01-01|DEBUG|module|details",
-    "plain connection refused message",
-    "2026-01-01|ERROR|module|database timeout",
-  ].join("\n"));
-  const fsApi = {
-    stat: async () => ({ size: content.length, mtimeMs: 123, ino: 7, birthtimeMs: 123 }),
-    readRange: async (_filePath, byteOffset, length) => ({
-      bytes: content.subarray(byteOffset, byteOffset + length),
-      totalSize: content.length,
-    }),
-    list: async () => ({ path: "", entries: [] }),
-  };
-  const engine = new LogEngine({
-    dataPath: null,
-    capabilities: { hostReadRange: true, hostStat: true },
-    fileSystem: createHostFileSystem(fsApi),
-  });
+  const file = await makeTempFile(
+    "sample.log",
+    [
+      "2026-01-01|INFO|module|request returned ERROR text",
+      "2026-01-01|WARN|module|retrying",
+      "2026-01-01|DEBUG|module|details",
+      "plain connection refused message",
+      "2026-01-01|ERROR|module|database timeout",
+    ].join("\n"),
+  );
+  const engine = new LogEngine({ dataPath: null });
   try {
-    await engine.setRoot({ path: "" });
-    const opened = await engine.openFile("sample.log");
+    const opened = await engine.openFile(file);
     const filtered = await engine.page({
       fileId: opened.fileId,
       fromLine: 1,
@@ -131,25 +114,9 @@ test("engine uses the same level filter and compiled query for native files", as
   }
 });
 
-function makeEngine(content) {
-  const buf = Buffer.from(content, "utf8");
-  const fsApi = {
-    stat: async () => ({ size: buf.length, mtimeMs: 1, ino: 9, birthtimeMs: 1 }),
-    readRange: async (_p, byteOffset, length) => ({
-      bytes: buf.subarray(byteOffset, byteOffset + length),
-      totalSize: buf.length,
-    }),
-    list: async () => ({ path: "", entries: [] }),
-  };
-  return new LogEngine({
-    dataPath: null,
-    capabilities: { hostReadRange: true, hostStat: true },
-    fileSystem: createHostFileSystem(fsApi),
-  });
-}
-
 test("engine text filter shows only matching lines and supports invert", async () => {
-  const engine = makeEngine(
+  const file = await makeTempFile(
+    "filter.log",
     [
       "2026-01-01|INFO|app|start ok",
       "2026-01-01|ERROR|app|database timeout",
@@ -158,9 +125,9 @@ test("engine text filter shows only matching lines and supports invert", async (
       "2026-01-01|ERROR|app|connection refused",
     ].join("\n"),
   );
+  const engine = new LogEngine({ dataPath: null });
   try {
-    await engine.setRoot({ path: "" });
-    const opened = await engine.openFile("filter.log");
+    const opened = await engine.openFile(file);
     await new Promise((r) => setTimeout(r, 20)); // let the driver index
     const onlyErrors = await engine.page({
       fileId: opened.fileId,
@@ -194,11 +161,50 @@ test("engine text filter shows only matching lines and supports invert", async (
   }
 });
 
-test("poll after open does not treat existing lines as new when client is synced", async () => {
-  const engine = makeEngine("line one\nline two\nline three\n");
+test("filtered paging keeps a true scan cursor: no missed or duplicated matches", async () => {
+  const lines = [];
+  for (let i = 1; i <= 500; i += 1) {
+    lines.push(i % 50 === 0 ? `2026-01-01|ERROR|app|match ${i}` : `2026-01-01|INFO|app|filler ${i}`);
+  }
+  const file = await makeTempFile("cursor.log", lines.join("\n"));
+  const engine = new LogEngine({ dataPath: null });
   try {
-    await engine.setRoot({ path: "" });
-    const opened = await engine.openFile("static.log");
+    const opened = await engine.openFile(file);
+    let from = 1;
+    let guard = 0;
+    const collected = [];
+    let endLines = [];
+    for (; guard < 20; guard += 1) {
+      const res = await engine.page({
+        fileId: opened.fileId,
+        fromLine: from,
+        count: 4,
+        filter: { query: "match", isRegex: false, caseSensitive: false },
+      });
+      collected.push(...res.lines);
+      endLines.push(res.scanEndLine);
+      from = res.scanEndLine;
+      if (res.eof) break;
+    }
+    assert.equal(guard < 20, true, "paging terminated");
+    assert.deepEqual(
+      collected.map((l) => l.no),
+      [50, 100, 150, 200, 250, 300, 350, 400, 450, 500],
+    );
+    assert.equal(endLines[0] > 4, true, "scanEndLine points past scanned fillers, not past the last match");
+    for (let i = 1; i < endLines.length; i += 1) {
+      assert.ok(endLines[i] > endLines[i - 1], "scan cursor strictly advances");
+    }
+  } finally {
+    engine.dispose();
+  }
+});
+
+test("poll after open does not treat existing lines as new when client is synced", async () => {
+  const file = await makeTempFile("static.log", "line one\nline two\nline three\n");
+  const engine = new LogEngine({ dataPath: null });
+  try {
+    const opened = await engine.openFile(file);
     // Sync as the renderer does after open: last seen = whatever is indexed now.
     const first = await engine.poll({ fileId: opened.fileId, sinceLine: opened.totalLines || 0 });
     // After indexing catch-up, a client that tracks totalLines should not get a gap.
@@ -207,6 +213,54 @@ test("poll after open does not treat existing lines as new when client is synced
     assert.equal(append.length, 0);
     assert.equal(synced.indexDone, true);
     assert.equal(synced.totalLines, 3);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test("poll detects in-place truncation rotation and reloads", async () => {
+  const file = await makeTempFile("rotate.log", "old one\nold two\nold three\n");
+  const engine = new LogEngine({ dataPath: null });
+  try {
+    const opened = await engine.openFile(file);
+    await new Promise((r) => setTimeout(r, 30));
+    const st = engine.statsOf({ fileId: opened.fileId });
+    assert.equal(st.totalLines, 3);
+    assert.equal(st.indexDone, true);
+    // Rotate in place: truncate + rewrite, like a log rotator would.
+    await fs.writeFile(file, Buffer.from("new alpha\nnew beta\n", "utf8"));
+    const res = await engine.poll({ fileId: opened.fileId, sinceLine: 3 });
+    assert.equal(res.rotated, true);
+    const after = await engine.poll({ fileId: opened.fileId, sinceLine: 0 });
+    assert.equal(after.totalLines, 2);
+    assert.equal(after.indexDone, true);
+    const page = await engine.page({ fileId: opened.fileId, fromLine: 1, count: 5 });
+    assert.deepEqual(page.lines.map((l) => l.text), ["new alpha", "new beta"]);
+  } finally {
+    engine.dispose();
+  }
+});
+
+test("listDir natively lists files with size and mtime", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "log-viewer-dir-"));
+  await fs.writeFile(path.join(dir, "a.log"), "hello\n", "utf8");
+  await fs.writeFile(path.join(dir, "b.txt"), "world\n", "utf8");
+  await fs.mkdir(path.join(dir, "sub"));
+  const engine = new LogEngine({ dataPath: null });
+  try {
+    const listed = await engine.listDir(dir);
+    assert.equal(listed.path, dir);
+    const names = listed.entries.map((e) => e.name).sort();
+    assert.deepEqual(names, ["a.log", "b.txt"]);
+    for (const ent of listed.entries) {
+      assert.equal(ent.isDirectory, false);
+      assert.equal(typeof ent.size, "number");
+      assert.equal(typeof ent.mtimeMs, "number");
+      assert.equal(path.isAbsolute(ent.path), true);
+    }
+    // empty / missing paths fail with a clear error
+    await assert.rejects(() => engine.listDir(""), /directory path required/);
+    await assert.rejects(() => engine.listDir(path.join(dir, "nope")), /cannot list directory/);
   } finally {
     engine.dispose();
   }
